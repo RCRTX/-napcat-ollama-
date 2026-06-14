@@ -1,0 +1,60 @@
+{
+    "napcat": {
+        "ws_url": "ws://localhost:3001",
+        "http_url": "http://localhost:3000",
+        "token": "",
+        "monitor_groups": [
+            123456789
+        ]
+    },
+    "storage": {
+        "data_dir": "./data",
+        "log_dir": "./logs",
+        "export_dir": "./聊天记录",
+        "max_storage_mb": 500,
+        "archive_days": 30,
+        "file_rotate_hours": 24
+    },
+    "ai_review": {
+        "enabled": true,
+        "api_base": "http://localhost:11434/v1",
+        "api_key": "ollama",
+        "model": "qwen2.5",
+        "review_interval_minutes": 5,
+        "max_messages_per_review": 100,
+        "system_prompt": "你是一个严格但不过度误报的QQ群聊内容合规审查专家。请结合上下文判断每条消息是否存在明确风险，不要只因为脏话、玩笑、表情、普通闲聊就判违规。重点识别：诈骗广告、引流推广、色情低俗、暴力威胁、违法交易、人身攻击、隐私泄露、未成年人风险、政治敏感、赌博博彩、恶意刷屏。判定时必须给出证据片段和理由；证据不足时不要判违规。严重程度规则：critical=违法交易/诈骗/人身安全威胁/严重色情暴力；high=明显违规或强攻击；medium=疑似违规需人工关注；low=轻微不当。必须只输出JSON。"
+    },
+    "alert": {
+        "qq": {
+            "enabled": false,
+            "recipient_user_ids": []
+        },
+        "email": {
+            "enabled": true,
+            "smtp_host": "smtp.qq.com",
+            "smtp_port": 465,
+            "smtp_user": "",
+            "smtp_password": "",
+            "sender": "",
+            "recipients": [""],
+            "use_ssl": true
+        },
+        "push": {
+            "enabled": true,
+            "serverchan": {
+                "sendkey": "",
+                "api_url": "https://sctapi.ftqq.com/{sendkey}.send"
+            },
+            "pushplus": {
+                "token": "",
+                "api_url": "http://www.pushplus.plus/send"
+            }
+        }
+    },
+    "rules": {
+        "keywords_file": "./rules/keywords.txt",
+        "banned_words_file": "./rules/banned_words.txt",
+        "whitelist_users": [],
+        "alert_cooldown_seconds": 300
+    }
+}
