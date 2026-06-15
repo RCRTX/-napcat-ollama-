@@ -357,18 +357,7 @@ class MessageStore:
                 ext = ".gif"
             elif "png" in url.lower():
                 ext = ".png"
-            url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
             group_dir = os.path.dirname(os.path.dirname(os.path.dirname(save_dir)))
-            existing_path = self._find_existing_image(group_dir, url_hash)
-            if existing_path:
-                return f"/api/images/{os.path.relpath(existing_path, self.data_dir).replace(os.sep, '/')}"
-
-            filename = self._build_image_filename(message, image_index, url_hash, ext)
-            local_path = os.path.join(save_dir, filename)
-
-            # 同一个图片URL只保存一份，重复消息直接指向同一个缓存文件
-            if os.path.exists(local_path):
-                return f"/api/images/{os.path.relpath(local_path, self.data_dir).replace(os.sep, '/')}"
 
             max_bytes = max(1, self.max_image_size_mb) * 1024 * 1024
             resp = requests.get(url, timeout=10, stream=True)
@@ -378,7 +367,10 @@ class MessageStore:
                     logger.info(f"图片超过大小限制，跳过保存: {content_length} bytes")
                     return None
                 downloaded = 0
-                with open(local_path, 'wb') as f:
+                hasher = hashlib.sha256()
+                temp_name = f".tmp_{uuid.uuid4().hex}.download"
+                temp_path = os.path.join(save_dir, temp_name)
+                with open(temp_path, 'wb') as f:
                     for chunk in resp.iter_content(8192):
                         if not chunk:
                             continue
@@ -386,12 +378,25 @@ class MessageStore:
                         if downloaded > max_bytes:
                             f.close()
                             try:
-                                os.remove(local_path)
+                                os.remove(temp_path)
                             except OSError:
                                 pass
                             logger.info(f"图片下载超过大小限制，已删除临时文件: {url}")
                             return None
+                        hasher.update(chunk)
                         f.write(chunk)
+                content_hash = hasher.hexdigest()
+                existing_path = self._find_existing_image(group_dir, content_hash, downloaded)
+                if existing_path:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                    return f"/api/images/{os.path.relpath(existing_path, self.data_dir).replace(os.sep, '/')}"
+
+                filename = self._build_image_filename(message, image_index, content_hash, downloaded, ext)
+                local_path = os.path.join(save_dir, filename)
+                os.replace(temp_path, local_path)
                 rel = os.path.relpath(local_path, self.data_dir).replace(os.sep, '/')
                 logger.debug(f"图片已保存: {local_path}")
                 return f"/api/images/{rel}"
@@ -537,17 +542,16 @@ class MessageStore:
         return (text[:max_len] or "未知")
 
     def _build_image_filename(self, message: Dict[str, Any], image_index: int,
-                              url_hash: str, ext: str) -> str:
-        """生成易读且可去重的图片文件名"""
+                              content_hash: str, size_bytes: int, ext: str) -> str:
+        """生成简短易读且可按内容去重的图片文件名"""
         dt = message.get("datetime", "")
         date_part = self._message_date(message).replace("-", "")
         time_part = "000000"
         if len(dt) >= 19:
             time_part = dt[11:19].replace(":", "")
         user_id = self._safe_filename_part(message.get("user_id", 0), 20)
-        nickname = self._safe_filename_part(message.get("card") or message.get("nickname", "未知"), 20)
-        message_id = self._safe_filename_part(message.get("message_id", 0), 24)
-        return f"{date_part}_{time_part}_QQ{user_id}_{nickname}_消息{message_id}_图{image_index}_{url_hash}{ext}"
+        short_hash = content_hash[:12]
+        return f"{date_part}_{time_part}_QQ{user_id}_图{image_index}_{short_hash}_{int(size_bytes)}B{ext}"
 
     def _build_attachment_filename(self, message: Dict[str, Any], index: int,
                                    original_name: str, url_hash: str, ext: str) -> str:
@@ -561,12 +565,12 @@ class MessageStore:
         base = self._safe_filename_part(os.path.splitext(original_name or "文件")[0], 36)
         return f"{date_part}_{time_part}_QQ{user_id}_{nickname}_消息{message_id}_文件{index}_{base}_{url_hash}{ext}"
 
-    def _find_existing_image(self, group_dir: str, url_hash: str) -> Optional[str]:
-        """查找同一群内已缓存的相同图片"""
+    def _find_existing_image(self, group_dir: str, content_hash: str, size_bytes: int) -> Optional[str]:
+        """按内容哈希和字节数查找同一群内已缓存的相同图片"""
         images_root = os.path.join(group_dir, "附件", "图片")
         if not os.path.isdir(images_root):
             return None
-        marker = f"_{url_hash}."
+        marker = f"_{content_hash[:12]}_{int(size_bytes)}B."
         try:
             for dirpath, _, filenames in os.walk(images_root):
                 for filename in filenames:

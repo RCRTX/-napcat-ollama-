@@ -240,21 +240,6 @@ class HumanReadableExporter:
             elif "png" in low:
                 ext = ".png"
 
-        image_key = img_url or local_path or f"{group_id}_{date_str}_{message.get('user_id', 0)}"
-        image_hash = hashlib.sha256(image_key.encode("utf-8")).hexdigest()[:16]
-        existing_path = self._find_existing_image(group_id, image_hash)
-        if existing_path:
-            rel = os.path.relpath(existing_path, os.path.join(self.export_dir, f"群{group_id}"))
-            return rel.replace(os.sep, "/")
-
-        filename = self._build_image_filename(message, date_str, image_index, image_hash, ext)
-        dest_path = os.path.join(img_dir, filename)
-
-        # 同一图片只导出一份，重复消息指向同一个文件
-        if os.path.exists(dest_path):
-            rel = os.path.relpath(dest_path, os.path.join(self.export_dir, f"群{group_id}"))
-            return rel.replace(os.sep, "/")
-
         # 尝试从data目录复制
         if local_path:
             # local_path是/api/images/...格式，转换为实际文件路径
@@ -263,6 +248,13 @@ class HumanReadableExporter:
             src_path = os.path.join(data_dir, local_path.replace("/api/images/", "").replace("/", os.sep))
             if os.path.exists(src_path):
                 import shutil
+                content_hash, size_bytes = self._hash_file(src_path)
+                existing_path = self._find_existing_image(group_id, content_hash, size_bytes)
+                if existing_path:
+                    rel = os.path.relpath(existing_path, os.path.join(self.export_dir, f"群{group_id}"))
+                    return rel.replace(os.sep, "/")
+                filename = self._build_image_filename(message, date_str, image_index, content_hash, size_bytes, ext)
+                dest_path = os.path.join(img_dir, filename)
                 shutil.copy2(src_path, dest_path)
                 rel = os.path.relpath(dest_path, os.path.join(self.export_dir, f"群{group_id}"))
                 return rel.replace(os.sep, "/")
@@ -290,25 +282,30 @@ class HumanReadableExporter:
             elif "png" in url.lower():
                 ext = ".png"
 
-            image_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-            existing_path = self._find_existing_image(group_id, image_hash)
-            if existing_path:
-                rel = os.path.relpath(existing_path, os.path.join(self.export_dir, f"群{group_id}"))
-                return rel.replace(os.sep, "/")
-
-            filename = self._build_image_filename(message, date_str, image_index, image_hash, ext)
-            local_path = os.path.join(img_dir, filename)
-
-            # 同一图片URL只保存一份
-            if os.path.exists(local_path):
-                rel = os.path.relpath(local_path, os.path.join(self.export_dir, f"群{group_id}"))
-                return rel.replace(os.sep, "/")
-
             resp = requests.get(url, timeout=10, stream=True)
             if resp.status_code == 200:
-                with open(local_path, 'wb') as f:
+                hasher = hashlib.sha256()
+                downloaded = 0
+                temp_path = os.path.join(img_dir, f".tmp_{hashlib.sha1(url.encode('utf-8')).hexdigest()[:12]}.download")
+                with open(temp_path, 'wb') as f:
                     for chunk in resp.iter_content(8192):
+                        if not chunk:
+                            continue
+                        downloaded += len(chunk)
+                        hasher.update(chunk)
                         f.write(chunk)
+                content_hash = hasher.hexdigest()
+                existing_path = self._find_existing_image(group_id, content_hash, downloaded)
+                if existing_path:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                    rel = os.path.relpath(existing_path, os.path.join(self.export_dir, f"群{group_id}"))
+                    return rel.replace(os.sep, "/")
+                filename = self._build_image_filename(message, date_str, image_index, content_hash, downloaded, ext)
+                local_path = os.path.join(img_dir, filename)
+                os.replace(temp_path, local_path)
                 rel = os.path.relpath(local_path, os.path.join(self.export_dir, f"群{group_id}"))
                 logger.debug(f"图片已导出: {local_path}")
                 return rel.replace(os.sep, "/")
@@ -328,24 +325,23 @@ class HumanReadableExporter:
         return (text[:max_len] or "未知")
 
     def _build_image_filename(self, message: Dict[str, Any], date_str: str,
-                              image_index: int, image_hash: str, ext: str) -> str:
-        """生成易读且可去重的图片文件名"""
+                              image_index: int, content_hash: str,
+                              size_bytes: int, ext: str) -> str:
+        """生成简短易读且可按内容去重的图片文件名"""
         dt = message.get("datetime", "")
         date_part = date_str.replace("-", "")
         time_part = "000000"
         if len(dt) >= 19:
             time_part = dt[11:19].replace(":", "")
         user_id = self._safe_filename_part(message.get("user_id", 0), 20)
-        nickname = self._safe_filename_part(message.get("card") or message.get("nickname", "未知"), 20)
-        message_id = self._safe_filename_part(message.get("message_id", 0), 24)
-        return f"{date_part}_{time_part}_QQ{user_id}_{nickname}_消息{message_id}_图{image_index}_{image_hash}{ext}"
+        return f"{date_part}_{time_part}_QQ{user_id}_图{image_index}_{content_hash[:12]}_{int(size_bytes)}B{ext}"
 
-    def _find_existing_image(self, group_id: int, image_hash: str) -> Optional[str]:
-        """查找当前群已导出的相同图片"""
+    def _find_existing_image(self, group_id: int, content_hash: str, size_bytes: int) -> Optional[str]:
+        """按内容哈希和字节数查找当前群已导出的相同图片"""
         images_root = os.path.join(self.export_dir, f"群{group_id}", "附件", "图片")
         if not os.path.isdir(images_root):
             return None
-        marker = f"_{image_hash}."
+        marker = f"_{content_hash[:12]}_{int(size_bytes)}B."
         try:
             for dirpath, _, filenames in os.walk(images_root):
                 for filename in filenames:
@@ -354,6 +350,16 @@ class HumanReadableExporter:
         except OSError:
             return None
         return None
+
+    def _hash_file(self, file_path: str) -> Tuple[str, int]:
+        """计算文件内容哈希和字节数"""
+        hasher = hashlib.sha256()
+        size = 0
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                size += len(chunk)
+                hasher.update(chunk)
+        return hasher.hexdigest(), size
 
     def export_history_from_store(self, store) -> int:
         """从存储模块导出所有历史记录，启动时重建txt以避免重复追加"""
