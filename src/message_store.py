@@ -11,6 +11,7 @@ import gzip
 import threading
 import requests
 import hashlib
+import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
@@ -190,9 +191,9 @@ class MessageStore:
 
     def _save_to_file(self, group_id: int, message: Dict[str, Any]) -> None:
         """将消息写入JSON文件"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = self._message_date(message)
         group_dir = os.path.join(self.data_dir, str(group_id))
-        images_dir = os.path.join(group_dir, "images", "cache")
+        images_dir = os.path.join(group_dir, "附件", "图片", today)
         os.makedirs(group_dir, exist_ok=True)
         os.makedirs(images_dir, exist_ok=True)
 
@@ -206,6 +207,7 @@ class MessageStore:
                     # 精简segments但保留关键内容
                     if "content" in save_data and "segments" in save_data["content"]:
                         simplified_segments = []
+                        image_index = 0
                         for seg in save_data["content"]["segments"]:
                             seg_entry = {
                                 "type": seg["type"],
@@ -216,12 +218,13 @@ class MessageStore:
                                 seg_entry["text"] = seg["data"].get("text", "")
                             # 保留图片URL
                             elif seg["type"] == "image":
+                                image_index += 1
                                 img_url = seg["data"].get("url", "")
                                 seg_entry["url"] = img_url
                                 # 下载图片到本地
                                 if self.save_images:
                                     local_path = self._download_image(
-                                        img_url, images_dir, message.get("message_id", 0)
+                                        img_url, images_dir, message, image_index
                                     )
                                     if local_path:
                                         seg_entry["local_path"] = local_path
@@ -242,7 +245,8 @@ class MessageStore:
             except Exception as e:
                 logger.error(f"写入消息文件失败 (群{group_id}): {e}")
 
-    def _download_image(self, url: str, save_dir: str, message_id: int) -> Optional[str]:
+    def _download_image(self, url: str, save_dir: str,
+                        message: Dict[str, Any], image_index: int = 1) -> Optional[str]:
         """下载图片到本地"""
         if not url:
             return None
@@ -253,8 +257,13 @@ class MessageStore:
                 ext = ".gif"
             elif "png" in url.lower():
                 ext = ".png"
-            url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
-            filename = f"{url_hash}{ext}"
+            url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            group_dir = os.path.dirname(os.path.dirname(os.path.dirname(save_dir)))
+            existing_path = self._find_existing_image(group_dir, url_hash)
+            if existing_path:
+                return f"/api/images/{os.path.relpath(existing_path, self.data_dir).replace(os.sep, '/')}"
+
+            filename = self._build_image_filename(message, image_index, url_hash, ext)
             local_path = os.path.join(save_dir, filename)
 
             # 同一个图片URL只保存一份，重复消息直接指向同一个缓存文件
@@ -292,6 +301,49 @@ class MessageStore:
         except Exception as e:
             logger.debug(f"图片下载异常: {e}")
             return None
+
+    def _message_date(self, message: Dict[str, Any]) -> str:
+        """获取消息日期"""
+        dt = message.get("datetime", "")
+        if len(dt) >= 10:
+            return dt[:10]
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _safe_filename_part(self, value: Any, max_len: int = 24) -> str:
+        """清理文件名片段"""
+        text = str(value or "").strip()
+        text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text)
+        text = re.sub(r"\s+", "_", text)
+        text = text.strip("._ ")
+        return (text[:max_len] or "未知")
+
+    def _build_image_filename(self, message: Dict[str, Any], image_index: int,
+                              url_hash: str, ext: str) -> str:
+        """生成易读且可去重的图片文件名"""
+        dt = message.get("datetime", "")
+        date_part = self._message_date(message).replace("-", "")
+        time_part = "000000"
+        if len(dt) >= 19:
+            time_part = dt[11:19].replace(":", "")
+        user_id = self._safe_filename_part(message.get("user_id", 0), 20)
+        nickname = self._safe_filename_part(message.get("card") or message.get("nickname", "未知"), 20)
+        message_id = self._safe_filename_part(message.get("message_id", 0), 24)
+        return f"{date_part}_{time_part}_QQ{user_id}_{nickname}_消息{message_id}_图{image_index}_{url_hash}{ext}"
+
+    def _find_existing_image(self, group_dir: str, url_hash: str) -> Optional[str]:
+        """查找同一群内已缓存的相同图片"""
+        images_root = os.path.join(group_dir, "附件", "图片")
+        if not os.path.isdir(images_root):
+            return None
+        marker = f"_{url_hash}."
+        try:
+            for dirpath, _, filenames in os.walk(images_root):
+                for filename in filenames:
+                    if marker in filename:
+                        return os.path.join(dirpath, filename)
+        except OSError:
+            return None
+        return None
 
     def _add_to_index(self, group_id: int, message: Dict[str, Any]) -> None:
         """将消息添加到内存索引"""

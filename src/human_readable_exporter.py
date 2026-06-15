@@ -8,6 +8,7 @@ import time
 import threading
 import requests
 import hashlib
+import re
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -117,6 +118,7 @@ class HumanReadableExporter:
 
         parts = []
 
+        image_index = 0
         for seg in segments:
             seg_type = seg.get("type", "")
             # 兼容两种格式：精简后字段在顶层，原始数据在data子字典中
@@ -132,13 +134,14 @@ class HumanReadableExporter:
                     content_text = ""  # 避免重复
 
             elif seg_type == "image":
+                image_index += 1
                 # 优先使用已下载的本地路径
                 local_path = seg.get("local_path", "")
                 img_url = seg.get("url", "") or seg_data.get("url", "")
                 if local_path:
                     # 已经下载到data目录了，复制到聊天记录目录
                     dest_rel = self._copy_or_download_image(
-                        local_path, img_url, group_id, date_str, user_id
+                        local_path, img_url, message, date_str, image_index
                     )
                     if dest_rel:
                         parts.append(f"[图片] -> {dest_rel}")
@@ -146,7 +149,7 @@ class HumanReadableExporter:
                         parts.append("[图片]")
                 elif img_url:
                     dest_rel = self._download_image(
-                        img_url, group_id, date_str, user_id
+                        img_url, message, date_str, image_index
                     )
                     if dest_rel:
                         parts.append(f"[图片] -> {dest_rel}")
@@ -215,10 +218,11 @@ class HumanReadableExporter:
         return f"[{dt}] {nickname}(QQ:{user_id}): {content_str}"
 
     def _copy_or_download_image(self, local_path: str, img_url: str,
-                                group_id: int, date_str: str,
-                                user_id: int) -> Optional[str]:
+                                message: Dict[str, Any], date_str: str,
+                                image_index: int = 1) -> Optional[str]:
         """从data目录复制已下载的图片，或从URL下载"""
-        img_dir = os.path.join(self.export_dir, f"群{group_id}", "images", "cache")
+        group_id = message.get("group_id", 0)
+        img_dir = os.path.join(self.export_dir, f"群{group_id}", "附件", "图片", date_str)
         os.makedirs(img_dir, exist_ok=True)
 
         # 从local_path推断扩展名
@@ -236,9 +240,14 @@ class HumanReadableExporter:
             elif "png" in low:
                 ext = ".png"
 
-        image_key = img_url or local_path or f"{group_id}_{date_str}_{user_id}"
-        image_hash = hashlib.sha256(image_key.encode("utf-8")).hexdigest()[:32]
-        filename = f"{image_hash}{ext}"
+        image_key = img_url or local_path or f"{group_id}_{date_str}_{message.get('user_id', 0)}"
+        image_hash = hashlib.sha256(image_key.encode("utf-8")).hexdigest()[:16]
+        existing_path = self._find_existing_image(group_id, image_hash)
+        if existing_path:
+            rel = os.path.relpath(existing_path, os.path.join(self.export_dir, f"群{group_id}"))
+            return rel.replace(os.sep, "/")
+
+        filename = self._build_image_filename(message, date_str, image_index, image_hash, ext)
         dest_path = os.path.join(img_dir, filename)
 
         # 同一图片只导出一份，重复消息指向同一个文件
@@ -260,18 +269,19 @@ class HumanReadableExporter:
 
         # 从URL下载
         if img_url:
-            return self._download_image(img_url, group_id, date_str, user_id)
+            return self._download_image(img_url, message, date_str, image_index)
 
         return None
 
-    def _download_image(self, url: str, group_id: int,
-                        date_str: str, user_id: int) -> Optional[str]:
+    def _download_image(self, url: str, message: Dict[str, Any],
+                        date_str: str, image_index: int = 1) -> Optional[str]:
         """下载图片到本地，返回相对路径"""
         if not url:
             return None
 
         try:
-            img_dir = os.path.join(self.export_dir, f"群{group_id}", "images", "cache")
+            group_id = message.get("group_id", 0)
+            img_dir = os.path.join(self.export_dir, f"群{group_id}", "附件", "图片", date_str)
             os.makedirs(img_dir, exist_ok=True)
 
             ext = ".jpg"
@@ -280,8 +290,13 @@ class HumanReadableExporter:
             elif "png" in url.lower():
                 ext = ".png"
 
-            image_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
-            filename = f"{image_hash}{ext}"
+            image_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            existing_path = self._find_existing_image(group_id, image_hash)
+            if existing_path:
+                rel = os.path.relpath(existing_path, os.path.join(self.export_dir, f"群{group_id}"))
+                return rel.replace(os.sep, "/")
+
+            filename = self._build_image_filename(message, date_str, image_index, image_hash, ext)
             local_path = os.path.join(img_dir, filename)
 
             # 同一图片URL只保存一份
@@ -303,6 +318,42 @@ class HumanReadableExporter:
         except Exception as e:
             logger.debug(f"图片导出失败: {e}")
             return None
+
+    def _safe_filename_part(self, value: Any, max_len: int = 24) -> str:
+        """清理文件名片段"""
+        text = str(value or "").strip()
+        text = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", text)
+        text = re.sub(r"\s+", "_", text)
+        text = text.strip("._ ")
+        return (text[:max_len] or "未知")
+
+    def _build_image_filename(self, message: Dict[str, Any], date_str: str,
+                              image_index: int, image_hash: str, ext: str) -> str:
+        """生成易读且可去重的图片文件名"""
+        dt = message.get("datetime", "")
+        date_part = date_str.replace("-", "")
+        time_part = "000000"
+        if len(dt) >= 19:
+            time_part = dt[11:19].replace(":", "")
+        user_id = self._safe_filename_part(message.get("user_id", 0), 20)
+        nickname = self._safe_filename_part(message.get("card") or message.get("nickname", "未知"), 20)
+        message_id = self._safe_filename_part(message.get("message_id", 0), 24)
+        return f"{date_part}_{time_part}_QQ{user_id}_{nickname}_消息{message_id}_图{image_index}_{image_hash}{ext}"
+
+    def _find_existing_image(self, group_id: int, image_hash: str) -> Optional[str]:
+        """查找当前群已导出的相同图片"""
+        images_root = os.path.join(self.export_dir, f"群{group_id}", "附件", "图片")
+        if not os.path.isdir(images_root):
+            return None
+        marker = f"_{image_hash}."
+        try:
+            for dirpath, _, filenames in os.walk(images_root):
+                for filename in filenames:
+                    if marker in filename:
+                        return os.path.join(dirpath, filename)
+        except OSError:
+            return None
+        return None
 
     def export_history_from_store(self, store) -> int:
         """从存储模块导出所有历史记录，启动时重建txt以避免重复追加"""
