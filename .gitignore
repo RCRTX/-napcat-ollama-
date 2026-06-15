@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.zip
+*.7z
+*.rar
+
+config/config.json
+data/
+logs/
+聊天记录/
+
+.env
+.venv/
+venv/

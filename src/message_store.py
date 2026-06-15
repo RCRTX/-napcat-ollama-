@@ -10,6 +10,7 @@ import shutil
 import gzip
 import threading
 import requests
+import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
@@ -25,7 +26,10 @@ class MessageStore:
     def __init__(self, data_dir: str, log_dir: str,
                  max_storage_mb: int = 500,
                  archive_days: int = 30,
-                 file_rotate_hours: int = 24):
+                 file_rotate_hours: int = 24,
+                 save_images: bool = True,
+                 max_image_size_mb: int = 5,
+                 max_alert_records: int = 1000):
         """
         初始化存储管理器
 
@@ -40,6 +44,9 @@ class MessageStore:
         self.max_storage_mb = max_storage_mb
         self.archive_days = archive_days
         self.file_rotate_hours = file_rotate_hours
+        self.save_images = save_images
+        self.max_image_size_mb = max_image_size_mb
+        self.max_alert_records = max_alert_records
 
         # 按群号分目录存储
         self._group_dirs: Dict[int, str] = {}
@@ -140,8 +147,8 @@ class MessageStore:
                         except json.JSONDecodeError:
                             continue
                 # 限制数量
-                if len(self._alerts) > 1000:
-                    self._alerts = self._alerts[-1000:]
+                if len(self._alerts) > self.max_alert_records:
+                    self._alerts = self._alerts[-self.max_alert_records:]
             except Exception as e:
                 logger.error(f"加载历史告警失败: {e}")
 
@@ -169,9 +176,9 @@ class MessageStore:
         """保存一条告警记录"""
         with self._alerts_lock:
             self._alerts.append(alert)
-            # 内存中最多保留1000条告警
-            if len(self._alerts) > 1000:
-                self._alerts = self._alerts[-1000:]
+            # 内存中最多保留指定数量告警
+            if len(self._alerts) > self.max_alert_records:
+                self._alerts = self._alerts[-self.max_alert_records:]
 
         # 同时写入告警文件
         alert_file = os.path.join(self.data_dir, "alerts.jsonl")
@@ -185,7 +192,7 @@ class MessageStore:
         """将消息写入JSON文件"""
         today = datetime.now().strftime("%Y-%m-%d")
         group_dir = os.path.join(self.data_dir, str(group_id))
-        images_dir = os.path.join(group_dir, "images", today)
+        images_dir = os.path.join(group_dir, "images", "cache")
         os.makedirs(group_dir, exist_ok=True)
         os.makedirs(images_dir, exist_ok=True)
 
@@ -212,11 +219,12 @@ class MessageStore:
                                 img_url = seg["data"].get("url", "")
                                 seg_entry["url"] = img_url
                                 # 下载图片到本地
-                                local_path = self._download_image(
-                                    img_url, images_dir, message.get("message_id", 0)
-                                )
-                                if local_path:
-                                    seg_entry["local_path"] = local_path
+                                if self.save_images:
+                                    local_path = self._download_image(
+                                        img_url, images_dir, message.get("message_id", 0)
+                                    )
+                                    if local_path:
+                                        seg_entry["local_path"] = local_path
                             # 保留表情ID
                             elif seg["type"] == "face":
                                 seg_entry["id"] = seg["data"].get("id", "")
@@ -245,17 +253,35 @@ class MessageStore:
                 ext = ".gif"
             elif "png" in url.lower():
                 ext = ".png"
-            filename = f"{message_id}_{hash(url) % 100000}{ext}"
+            url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+            filename = f"{url_hash}{ext}"
             local_path = os.path.join(save_dir, filename)
 
-            # 已存在则跳过
+            # 同一个图片URL只保存一份，重复消息直接指向同一个缓存文件
             if os.path.exists(local_path):
                 return f"/api/images/{os.path.relpath(local_path, self.data_dir).replace(os.sep, '/')}"
 
+            max_bytes = max(1, self.max_image_size_mb) * 1024 * 1024
             resp = requests.get(url, timeout=10, stream=True)
             if resp.status_code == 200:
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > max_bytes:
+                    logger.info(f"图片超过大小限制，跳过保存: {content_length} bytes")
+                    return None
+                downloaded = 0
                 with open(local_path, 'wb') as f:
                     for chunk in resp.iter_content(8192):
+                        if not chunk:
+                            continue
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            f.close()
+                            try:
+                                os.remove(local_path)
+                            except OSError:
+                                pass
+                            logger.info(f"图片下载超过大小限制，已删除临时文件: {url}")
+                            return None
                         f.write(chunk)
                 rel = os.path.relpath(local_path, self.data_dir).replace(os.sep, '/')
                 logger.debug(f"图片已保存: {local_path}")
@@ -351,9 +377,61 @@ class MessageStore:
 
         if include_alerts:
             with self._alerts_lock:
-                response["alerts"] = self._alerts[-50:]  # 最近50条告警
+                response["alerts"] = self._sort_alerts_desc(self._alerts)[0:50]
+            self._attach_alerts_to_messages(response["messages"])
 
         return response
+
+    def _attach_alerts_to_messages(self, messages: List[Dict[str, Any]]) -> None:
+        """把违规告警标记附加到聊天记录上"""
+        if not messages:
+            return
+
+        with self._alerts_lock:
+            alerts = self._alerts.copy()
+
+        by_msg_id = {}
+        by_fallback = {}
+        for alert in alerts:
+            msg_id = alert.get("message_id")
+            if msg_id:
+                by_msg_id.setdefault(msg_id, []).append(alert)
+            fallback_key = (
+                alert.get("group_id"),
+                alert.get("user_id"),
+                alert.get("datetime")
+            )
+            by_fallback.setdefault(fallback_key, []).append(alert)
+
+        for msg in messages:
+            msg_alerts = []
+            msg_id = msg.get("message_id")
+            if msg_id and msg_id in by_msg_id:
+                msg_alerts.extend(by_msg_id[msg_id])
+
+            fallback_key = (
+                msg.get("group_id"),
+                msg.get("user_id"),
+                msg.get("datetime")
+            )
+            for alert in by_fallback.get(fallback_key, []):
+                if alert not in msg_alerts:
+                    msg_alerts.append(alert)
+
+            if msg_alerts:
+                msg["alerts"] = msg_alerts
+                msg["has_violation"] = True
+                latest = self._sort_alerts_desc(msg_alerts)[0]
+                msg["violation_summary"] = {
+                    "severity": latest.get("severity", "medium"),
+                    "category": latest.get("category", "other"),
+                    "category_label": latest.get("category_label", ""),
+                    "violation_type": latest.get("violation_type", ""),
+                    "secondary_status": latest.get("secondary_status", "not_reviewed"),
+                    "secondary_status_label": latest.get("secondary_status_label", "未二次复核"),
+                    "should_notify": latest.get("should_notify", True),
+                    "notified": latest.get("notified", False)
+                }
 
     def query_from_file(self, group_id: int, date: str,
                         user_id: int = None,
@@ -426,7 +504,9 @@ class MessageStore:
 
     def get_alerts(self, limit: int = 50,
                    group_id: int = None,
-                   severity: str = None) -> List[Dict]:
+                   severity: str = None,
+                   category: str = None,
+                   secondary_status: str = None) -> List[Dict]:
         """查询告警记录"""
         with self._alerts_lock:
             alerts = self._alerts.copy()
@@ -435,8 +515,24 @@ class MessageStore:
             alerts = [a for a in alerts if a.get("group_id") == group_id]
         if severity:
             alerts = [a for a in alerts if a.get("severity") == severity]
+        if category:
+            alerts = [a for a in alerts if a.get("category") == category]
+        if secondary_status:
+            alerts = [a for a in alerts if a.get("secondary_status") == secondary_status]
 
-        return alerts[-limit:]
+        return self._sort_alerts_desc(alerts)[:limit]
+
+    def _sort_alerts_desc(self, alerts: List[Dict]) -> List[Dict]:
+        """按告警时间从新到旧排序"""
+        def sort_key(alert: Dict[str, Any]) -> Any:
+            return (
+                alert.get("review_time")
+                or alert.get("time")
+                or alert.get("datetime")
+                or alert.get("message", {}).get("datetime")
+                or ""
+            )
+        return sorted(alerts, key=sort_key, reverse=True)
 
     def get_statistics(self) -> Dict[str, Any]:
         """获取统计信息"""
@@ -509,6 +605,7 @@ class MessageStore:
         cleanup_result = {
             "compressed": 0,
             "deleted": 0,
+            "alerts_compacted": 0,
             "freed_mb": 0
         }
 
@@ -557,6 +654,25 @@ class MessageStore:
                         except Exception as e:
                             logger.error(f"压缩文件失败: {file_path}, 错误: {e}")
 
+            # 删除过老的压缩消息文件
+            for filename in os.listdir(group_path):
+                if not filename.endswith(".jsonl.gz"):
+                    continue
+                file_path = os.path.join(group_path, filename)
+                date_str = filename.replace(".jsonl.gz", "")
+                try:
+                    file_date = datetime.strptime(date_str, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if file_date < delete_date:
+                    file_size = os.path.getsize(file_path)
+                    os.remove(file_path)
+                    cleanup_result["deleted"] += 1
+                    cleanup_result["freed_mb"] += file_size / (1024 * 1024)
+                    logger.info(f"已删除旧压缩文件: {file_path}")
+
+        cleanup_result["alerts_compacted"] = self._compact_alerts_file()
+
         cleanup_result["freed_mb"] = round(cleanup_result["freed_mb"], 2)
         logger.info(f"清理完成: 压缩{cleanup_result['compressed']}个文件, "
                     f"删除{cleanup_result['deleted']}个文件, "
@@ -564,17 +680,49 @@ class MessageStore:
 
         return cleanup_result
 
-    def _calculate_storage_size(self) -> float:
-        """计算数据目录的总大小(MB)"""
-        total_size = 0
-        for dirpath, dirnames, filenames in os.walk(self.data_dir):
+    def _compact_alerts_file(self) -> int:
+        """压缩告警文件，只保留最近的告警记录"""
+        alert_file = os.path.join(self.data_dir, "alerts.jsonl")
+        if not os.path.exists(alert_file):
+            return 0
+
+        try:
+            with self._alerts_lock:
+                alerts = self._sort_alerts_desc(self._alerts)[:self.max_alert_records]
+                # 写回文件时保持旧到新，方便追加和人工查看
+                alerts_to_write = list(reversed(alerts))
+                self._alerts = alerts_to_write[-self.max_alert_records:]
+
+            temp_file = alert_file + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                for alert in alerts_to_write:
+                    f.write(json.dumps(alert, ensure_ascii=False) + "\n")
+            os.replace(temp_file, alert_file)
+            return len(alerts_to_write)
+        except Exception as e:
+            logger.error(f"压缩告警文件失败: {e}")
+            return 0
+
+    def _calculate_path_size(self, path: str) -> int:
+        """计算文件或目录大小，单位字节"""
+        if os.path.isfile(path):
+            try:
+                return os.path.getsize(path)
+            except OSError:
+                return 0
+        total = 0
+        for dirpath, _, filenames in os.walk(path):
             for filename in filenames:
                 file_path = os.path.join(dirpath, filename)
                 try:
-                    total_size += os.path.getsize(file_path)
+                    total += os.path.getsize(file_path)
                 except (OSError, FileNotFoundError):
                     continue
-        return total_size / (1024 * 1024)
+        return total
+
+    def _calculate_storage_size(self) -> float:
+        """计算数据目录的总大小(MB)"""
+        return self._calculate_path_size(self.data_dir) / (1024 * 1024)
 
     def flush(self) -> None:
         """刷新所有缓冲数据到磁盘"""

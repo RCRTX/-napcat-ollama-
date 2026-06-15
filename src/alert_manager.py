@@ -193,6 +193,7 @@ class AlertManager:
         self.serverchan_notifier: Optional[ServerChanNotifier] = None
         self.pushplus_notifier: Optional[PushPlusNotifier] = None
         self.qq_private_notifier: Optional[QQPrivateNotifier] = None
+        self._napcat_config = napcat_config
 
         # 初始化QQ私聊通知
         qq_cfg = alert_config.get("qq", {})
@@ -250,13 +251,36 @@ class AlertManager:
             "errors": 0
         }
 
+    def update_qq_recipients(self, enabled: bool, recipient_user_ids: List[int]) -> None:
+        """运行时更新QQ私聊通知接收人"""
+        if not enabled:
+            self.qq_private_notifier = None
+            logger.info("QQ私聊通知已关闭")
+            return
+
+        if not self.qq_private_notifier:
+            self.qq_private_notifier = QQPrivateNotifier(
+                http_url=self._napcat_config.get("http_url", ""),
+                token=self._napcat_config.get("token", ""),
+                recipient_user_ids=recipient_user_ids
+            )
+        else:
+            self.qq_private_notifier.recipient_user_ids = [
+                int(uid) for uid in recipient_user_ids if str(uid).strip()
+            ]
+        logger.info(f"QQ私聊通知接收人已更新: {self.qq_private_notifier.recipient_user_ids}")
+
     def send_violation_alert(self, violation: Dict[str, Any]) -> None:
         """发送违规告警"""
         self._stats["total_alerts"] += 1
 
         message = violation.get("message", {})
         severity = violation.get("severity", "medium")
-        violation_type = violation.get("type", "")
+        violation_type = violation.get("violation_type") or violation.get("type", "")
+        category_label = violation.get("category_label", "")
+        secondary_status_label = violation.get("secondary_status_label", "")
+        secondary_reason = violation.get("secondary_reason", "")
+        report_basis_label = violation.get("report_basis_label", "")
         reason = violation.get("reason", "")
         matched_word = violation.get("matched_word", "")
         content_preview = violation.get("content_preview", "")
@@ -283,7 +307,10 @@ class AlertManager:
 {'='*40}
 
 严重程度: {severity_display}
+违规分类: {category_label}
 违规类型: {violation_type}
+二次复核: {secondary_status_label}
+上报依据: {report_basis_label}
 群号: {group_id}
 用户: {nickname} (QQ: {user_id})
 时间: {msg_time}
@@ -293,6 +320,7 @@ class AlertManager:
 
 判定理由:
 {reason}
+{("二次复核理由: " + secondary_reason) if secondary_reason else ""}
 
 请及时处理！
 时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -300,7 +328,10 @@ class AlertManager:
 
         qq_content = f"""【QQ群聊违规告警】
 严重程度：{severity_display}
+违规分类：{category_label}
 违规类型：{violation_type}
+二次复核：{secondary_status_label}
+上报依据：{report_basis_label}
 群号：{group_id}
 用户：{nickname}（QQ:{user_id}）
 消息时间：{msg_time}
@@ -310,6 +341,7 @@ class AlertManager:
 
 判定理由：
 {reason}
+{("二次复核理由：" + secondary_reason) if secondary_reason else ""}
 
 告警时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
 
@@ -325,7 +357,10 @@ class AlertManager:
     <div style="padding: 20px;">
         <table style="width: 100%; border-collapse: collapse;">
             <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold; width: 100px;">严重程度</td><td style="padding: 8px; border-bottom: 1px solid #eee;">{severity_display}</td></tr>
+            <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">违规分类</td><td style="padding: 8px; border-bottom: 1px solid #eee;">{category_label}</td></tr>
             <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">违规类型</td><td style="padding: 8px; border-bottom: 1px solid #eee;">{violation_type}</td></tr>
+            <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">二次复核</td><td style="padding: 8px; border-bottom: 1px solid #eee;">{secondary_status_label}</td></tr>
+            <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">上报依据</td><td style="padding: 8px; border-bottom: 1px solid #eee;">{report_basis_label}</td></tr>
             <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">群号</td><td style="padding: 8px; border-bottom: 1px solid #eee;">{group_id}</td></tr>
             <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">用户</td><td style="padding: 8px; border-bottom: 1px solid #eee;">{nickname} (QQ: {user_id})</td></tr>
             <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">时间</td><td style="padding: 8px; border-bottom: 1px solid #eee;">{msg_time}</td></tr>
@@ -336,6 +371,7 @@ class AlertManager:
         <div style="margin-top: 10px; padding: 12px; background: #f5f5f5; border-radius: 4px;">
             <strong>判定理由:</strong><br>{reason}
         </div>
+        {'<div style="margin-top: 10px; padding: 12px; background: #f0f5ff; border-radius: 4px;"><strong>二次复核理由:</strong><br>' + secondary_reason + '</div>' if secondary_reason else ''}
     </div>
     <div style="background: #f9f9f9; padding: 10px 20px; color: #999; font-size: 12px; text-align: center;">
         QQ群聊监控系统 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}

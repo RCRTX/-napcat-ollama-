@@ -7,6 +7,7 @@ import os
 import time
 import threading
 import requests
+import hashlib
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -35,6 +36,17 @@ class HumanReadableExporter:
 
         os.makedirs(export_dir, exist_ok=True)
         logger.info(f"人类可读导出器初始化完成，导出目录: {export_dir}")
+
+    def update_export_dir(self, export_dir: str) -> None:
+        """运行时更新聊天记录TXT导出目录"""
+        if not export_dir:
+            return
+        export_dir = os.path.abspath(export_dir)
+        os.makedirs(export_dir, exist_ok=True)
+        with self._file_lock:
+            self.export_dir = export_dir
+            self._img_counters.clear()
+        logger.info(f"聊天记录TXT导出目录已更新: {export_dir}")
 
     def export_message(self, message: Dict[str, Any]) -> None:
         """导出一条消息到txt文件"""
@@ -206,16 +218,8 @@ class HumanReadableExporter:
                                 group_id: int, date_str: str,
                                 user_id: int) -> Optional[str]:
         """从data目录复制已下载的图片，或从URL下载"""
-        img_dir = os.path.join(self.export_dir, f"群{group_id}", "images", date_str)
+        img_dir = os.path.join(self.export_dir, f"群{group_id}", "images", "cache")
         os.makedirs(img_dir, exist_ok=True)
-
-        # 生成目标文件名
-        counter_key = f"{group_id}_{date_str}"
-        if counter_key not in self._img_counters:
-            self._img_counters[counter_key] = 1
-        else:
-            self._img_counters[counter_key] += 1
-        idx = self._img_counters[counter_key]
 
         # 从local_path推断扩展名
         ext = ".jpg"
@@ -232,10 +236,12 @@ class HumanReadableExporter:
             elif "png" in low:
                 ext = ".png"
 
-        filename = f"{user_id}_{idx:03d}{ext}"
+        image_key = img_url or local_path or f"{group_id}_{date_str}_{user_id}"
+        image_hash = hashlib.sha256(image_key.encode("utf-8")).hexdigest()[:32]
+        filename = f"{image_hash}{ext}"
         dest_path = os.path.join(img_dir, filename)
 
-        # 已存在则跳过
+        # 同一图片只导出一份，重复消息指向同一个文件
         if os.path.exists(dest_path):
             rel = os.path.relpath(dest_path, os.path.join(self.export_dir, f"群{group_id}"))
             return rel.replace(os.sep, "/")
@@ -265,16 +271,8 @@ class HumanReadableExporter:
             return None
 
         try:
-            img_dir = os.path.join(self.export_dir, f"群{group_id}", "images", date_str)
+            img_dir = os.path.join(self.export_dir, f"群{group_id}", "images", "cache")
             os.makedirs(img_dir, exist_ok=True)
-
-            # 生成文件名
-            counter_key = f"{group_id}_{date_str}"
-            if counter_key not in self._img_counters:
-                self._img_counters[counter_key] = 1
-            else:
-                self._img_counters[counter_key] += 1
-            idx = self._img_counters[counter_key]
 
             ext = ".jpg"
             if "gif" in url.lower():
@@ -282,10 +280,11 @@ class HumanReadableExporter:
             elif "png" in url.lower():
                 ext = ".png"
 
-            filename = f"{user_id}_{idx:03d}{ext}"
+            image_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+            filename = f"{image_hash}{ext}"
             local_path = os.path.join(img_dir, filename)
 
-            # 已存在则跳过
+            # 同一图片URL只保存一份
             if os.path.exists(local_path):
                 rel = os.path.relpath(local_path, os.path.join(self.export_dir, f"群{group_id}"))
                 return rel.replace(os.sep, "/")

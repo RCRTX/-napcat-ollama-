@@ -53,7 +53,10 @@ class QQMonitor:
             log_dir=self.config.storage['log_dir'],
             max_storage_mb=self.config.storage['max_storage_mb'],
             archive_days=self.config.storage['archive_days'],
-            file_rotate_hours=self.config.storage['file_rotate_hours']
+            file_rotate_hours=self.config.storage['file_rotate_hours'],
+            save_images=self.config.storage.get('save_images', True),
+            max_image_size_mb=self.config.storage.get('max_image_size_mb', 5),
+            max_alert_records=self.config.storage.get('max_alert_records', 1000)
         )
 
         # NapCat客户端
@@ -104,6 +107,7 @@ class QQMonitor:
             export_dir=self.config.storage.get('export_dir'),
             max_storage_mb=self.config.storage.get('max_storage_mb', 500)
         )
+        self.web_panel.set_components(exporter=self.exporter)
         # 导出已有的历史记录
         logger.info("正在导出历史记录为人类可读格式...")
         self.exporter.export_history_from_store(self.store)
@@ -136,10 +140,19 @@ class QQMonitor:
         alert_record = {
             "type": violation.get("type", "unknown"),
             "severity": violation.get("severity", "medium"),
+            "category": violation.get("category", "other"),
+            "category_label": violation.get("category_label", ""),
             "violation_type": violation.get("violation_type", violation.get("type", "")),
             "reason": violation.get("reason", ""),
+            "secondary_status": violation.get("secondary_status", "not_reviewed"),
+            "secondary_status_label": violation.get("secondary_status_label", "未二次复核"),
+            "secondary_reason": violation.get("secondary_reason", ""),
+            "report_basis": violation.get("report_basis", "primary_review"),
+            "report_basis_label": violation.get("report_basis_label", "按首次结果上报"),
+            "should_notify": violation.get("should_notify", True),
             "matched_word": violation.get("matched_word", ""),
             "content_preview": violation.get("content_preview", ""),
+            "message_id": message.get("message_id", 0),
             "group_id": message.get("group_id", 0),
             "user_id": message.get("user_id", 0),
             "nickname": message.get("nickname", ""),
@@ -150,12 +163,19 @@ class QQMonitor:
             "notified": False
         }
 
+        # 发送通知
+        if alert_record["should_notify"]:
+            try:
+                self.alert.send_violation_alert(violation)
+                alert_record["notified"] = True
+            except Exception as e:
+                alert_record["notify_error"] = str(e)
+                logger.error(f"告警通知发送失败，告警记录仍会保存: {e}")
+        else:
+            logger.info("二次复核认为可能误报，已记录但不发送通知")
+
         # 保存告警记录
         self.store.save_alert(alert_record)
-
-        # 发送通知
-        self.alert.send_violation_alert(violation)
-        alert_record["notified"] = True
 
     def _run_ai_review_once(self, source: str = "手动") -> list:
         """立即执行一次AI审查"""
