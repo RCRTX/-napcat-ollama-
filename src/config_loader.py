@@ -25,6 +25,8 @@ DEFAULT_CONFIG = {
         "file_rotate_hours": 24,
         "save_images": True,
         "max_image_size_mb": 5,
+        "save_files": True,
+        "large_file_confirm_mb": 1024,
         "max_alert_records": 1000
     },
     "ai_review": {

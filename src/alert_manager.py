@@ -443,6 +443,56 @@ class AlertManager:
         self.send_violation_alert(test_violation)
         return True
 
+    def send_large_file_confirm_alert(self, record: Dict[str, Any]) -> None:
+        """发送大文件保存确认通知"""
+        msg = record.get("message", {})
+        title = f"【大文件保存确认】{record.get('name', '文件')}"
+        content = f"""检测到超过阈值的大文件，已暂停保存，等待你确认。
+
+文件ID：{record.get('file_id')}
+文件名：{record.get('name')}
+文件大小：{record.get('size_text')}
+类型：{record.get('segment_type')}
+群号：{msg.get('group_id')}
+发送者：{msg.get('card') or msg.get('nickname', '未知')}（QQ:{msg.get('user_id')}）
+消息时间：{msg.get('datetime')}
+
+确认方式：
+1. 在Web面板“系统配置”里点击“待确认大文件”，选择确认保存或拒绝保存。
+2. 也可以私聊机器人回复：保存 {record.get('file_id')}
+3. 如不想保存，私聊机器人回复：拒绝 {record.get('file_id')}
+"""
+        html = "<pre style='font-family: Microsoft YaHei, sans-serif; white-space: pre-wrap;'>" + content + "</pre>"
+
+        if self.qq_private_notifier:
+            try:
+                if self.qq_private_notifier.send(content):
+                    self._stats["qq_sent"] += 1
+            except Exception as e:
+                logger.error(f"QQ大文件确认通知异常: {e}")
+                self._stats["errors"] += 1
+        if self.email_notifier:
+            try:
+                if self.email_notifier.send(title, html, html=True):
+                    self._stats["email_sent"] += 1
+            except Exception as e:
+                logger.error(f"邮件大文件确认通知异常: {e}")
+                self._stats["errors"] += 1
+        if self.serverchan_notifier:
+            try:
+                if self.serverchan_notifier.send(title, content):
+                    self._stats["push_sent"] += 1
+            except Exception as e:
+                logger.error(f"Server酱大文件确认通知异常: {e}")
+                self._stats["errors"] += 1
+        if self.pushplus_notifier:
+            try:
+                if self.pushplus_notifier.send(title, html, template="html"):
+                    self._stats["push_sent"] += 1
+            except Exception as e:
+                logger.error(f"PushPlus大文件确认通知异常: {e}")
+                self._stats["errors"] += 1
+
     def get_stats(self) -> Dict[str, int]:
         """获取告警统计"""
         return self._stats.copy()

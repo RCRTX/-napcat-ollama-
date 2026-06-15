@@ -56,6 +56,8 @@ class QQMonitor:
             file_rotate_hours=self.config.storage['file_rotate_hours'],
             save_images=self.config.storage.get('save_images', True),
             max_image_size_mb=self.config.storage.get('max_image_size_mb', 5),
+            save_files=self.config.storage.get('save_files', True),
+            large_file_confirm_mb=self.config.storage.get('large_file_confirm_mb', 1024),
             max_alert_records=self.config.storage.get('max_alert_records', 1000)
         )
 
@@ -87,6 +89,10 @@ class QQMonitor:
 
         # 注册消息处理回调
         self.napcat.on_message(self._on_message_received)
+        self.napcat.on_private_message(self._on_private_message_received)
+
+        # 注册大文件确认通知
+        self.store.on_large_file_pending(self.alert.send_large_file_confirm_alert)
 
         # 注册违规回调
         self.compliance.on_violation(self._on_violation_detected)
@@ -176,6 +182,32 @@ class QQMonitor:
 
         # 保存告警记录
         self.store.save_alert(alert_record)
+
+    def _on_private_message_received(self, message: dict) -> None:
+        """私聊消息回调，用于确认大文件保存"""
+        text = (message.get("text") or "").strip()
+        user_id = int(message.get("user_id", 0) or 0)
+        allowed = []
+        qq_notifier = getattr(self.alert, "qq_private_notifier", None)
+        if qq_notifier:
+            allowed = [int(x) for x in getattr(qq_notifier, "recipient_user_ids", [])]
+        if allowed and user_id not in allowed:
+            logger.info(f"忽略非通知接收人的私聊管理命令: {user_id}")
+            return
+
+        parts = text.split()
+        if len(parts) < 2:
+            return
+        action = parts[0].lower()
+        file_id = parts[1].strip()
+        if action in ("保存", "save", "确认", "yes", "y"):
+            result = self.store.confirm_pending_file(file_id)
+            reply = "大文件已确认保存" if result.get("success") else f"大文件保存失败：{result.get('error')}"
+            self.napcat.send_private_message(user_id, f"{reply}\n文件ID：{file_id}")
+        elif action in ("拒绝", "reject", "no", "n", "取消"):
+            result = self.store.reject_pending_file(file_id)
+            reply = "已拒绝保存该大文件" if result.get("success") else f"拒绝失败：{result.get('error')}"
+            self.napcat.send_private_message(user_id, f"{reply}\n文件ID：{file_id}")
 
     def _run_ai_review_once(self, source: str = "手动") -> list:
         """立即执行一次AI审查"""

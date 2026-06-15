@@ -12,6 +12,7 @@ import threading
 import requests
 import hashlib
 import re
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
@@ -30,6 +31,8 @@ class MessageStore:
                  file_rotate_hours: int = 24,
                  save_images: bool = True,
                  max_image_size_mb: int = 5,
+                 save_files: bool = True,
+                 large_file_confirm_mb: int = 1024,
                  max_alert_records: int = 1000):
         """
         初始化存储管理器
@@ -47,7 +50,10 @@ class MessageStore:
         self.file_rotate_hours = file_rotate_hours
         self.save_images = save_images
         self.max_image_size_mb = max_image_size_mb
+        self.save_files = save_files
+        self.large_file_confirm_mb = large_file_confirm_mb
         self.max_alert_records = max_alert_records
+        self._large_file_threshold_bytes = max(1, large_file_confirm_mb) * 1024 * 1024
 
         # 按群号分目录存储
         self._group_dirs: Dict[int, str] = {}
@@ -69,11 +75,17 @@ class MessageStore:
         self._alerts: List[Dict] = []
         self._alerts_lock = threading.Lock()
 
+        # 大文件待确认记录
+        self._pending_files: Dict[str, Dict[str, Any]] = {}
+        self._pending_lock = threading.Lock()
+        self._large_file_callbacks: List[Any] = []
+
         # 确保目录存在
         os.makedirs(data_dir, exist_ok=True)
 
         # 启动时加载历史记录
         self._load_history()
+        self._load_pending_files()
 
         logger.info(f"存储管理器初始化完成，数据目录: {data_dir}")
 
@@ -155,6 +167,34 @@ class MessageStore:
 
         logger.info(f"历史记录加载完成: {loaded_messages} 条消息, {loaded_alerts} 条告警")
 
+    def _pending_file_path(self) -> str:
+        """待确认大文件记录路径"""
+        return os.path.join(self.data_dir, "pending_large_files.json")
+
+    def _load_pending_files(self) -> None:
+        """加载待确认大文件记录"""
+        path = self._pending_file_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self._pending_files = {str(item.get("file_id")): item for item in data if item.get("file_id")}
+            elif isinstance(data, dict):
+                self._pending_files = data
+            logger.info(f"已加载 {len(self._pending_files)} 条待确认大文件记录")
+        except Exception as e:
+            logger.error(f"加载待确认大文件记录失败: {e}")
+
+    def _save_pending_files(self) -> None:
+        """保存待确认大文件记录"""
+        try:
+            with open(self._pending_file_path(), "w", encoding="utf-8") as f:
+                json.dump(list(self._pending_files.values()), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存待确认大文件记录失败: {e}")
+
     def save_message(self, message: Dict[str, Any]) -> None:
         """保存一条消息（自动去重）"""
         msg_id = message.get("message_id", 0)
@@ -189,6 +229,49 @@ class MessageStore:
         except Exception as e:
             logger.error(f"写入告警文件失败: {e}")
 
+    def on_large_file_pending(self, callback) -> None:
+        """注册大文件待确认回调"""
+        self._large_file_callbacks.append(callback)
+
+    def get_pending_files(self) -> List[Dict[str, Any]]:
+        """获取待确认文件列表"""
+        with self._pending_lock:
+            items = list(self._pending_files.values())
+        return sorted(items, key=lambda x: x.get("created_at", ""), reverse=True)
+
+    def confirm_pending_file(self, file_id: str) -> Dict[str, Any]:
+        """确认保存待处理大文件"""
+        with self._pending_lock:
+            record = self._pending_files.get(file_id)
+        if not record:
+            return {"success": False, "error": "待确认文件不存在"}
+        if record.get("status") == "saved":
+            return {"success": True, "message": "文件已经保存", "record": record}
+        if record.get("status") == "rejected":
+            return {"success": False, "error": "文件已被拒绝保存"}
+
+        local_path = self._download_attachment_record(record, force=True)
+        with self._pending_lock:
+            if local_path:
+                record["status"] = "saved"
+                record["local_path"] = local_path
+            else:
+                record["status"] = "download_failed"
+            self._pending_files[file_id] = record
+            self._save_pending_files()
+        return {"success": bool(local_path), "record": record, "error": "" if local_path else "文件下载失败"}
+
+    def reject_pending_file(self, file_id: str) -> Dict[str, Any]:
+        """拒绝保存待处理大文件"""
+        with self._pending_lock:
+            record = self._pending_files.get(file_id)
+            if not record:
+                return {"success": False, "error": "待确认文件不存在"}
+            record["status"] = "rejected"
+            self._pending_files[file_id] = record
+            self._save_pending_files()
+        return {"success": True, "record": record}
+
     def _save_to_file(self, group_id: int, message: Dict[str, Any]) -> None:
         """将消息写入JSON文件"""
         today = self._message_date(message)
@@ -208,6 +291,7 @@ class MessageStore:
                     if "content" in save_data and "segments" in save_data["content"]:
                         simplified_segments = []
                         image_index = 0
+                        attachment_index = 0
                         for seg in save_data["content"]["segments"]:
                             seg_entry = {
                                 "type": seg["type"],
@@ -228,6 +312,22 @@ class MessageStore:
                                     )
                                     if local_path:
                                         seg_entry["local_path"] = local_path
+                            elif seg["type"] in ("file", "video", "voice"):
+                                attachment_index += 1
+                                seg_data = seg.get("data", {})
+                                seg_entry.update({
+                                    "url": seg_data.get("url", ""),
+                                    "file": seg_data.get("file", ""),
+                                    "name": seg_data.get("name", seg_data.get("file", seg["type"])),
+                                    "size": self._parse_size(seg_data.get("size", 0))
+                                })
+                                if self.save_files:
+                                    result = self._save_attachment(seg["type"], seg_data, message, attachment_index)
+                                    if result.get("local_path"):
+                                        seg_entry["local_path"] = result["local_path"]
+                                    if result.get("pending_file_id"):
+                                        seg_entry["pending_file_id"] = result["pending_file_id"]
+                                        seg_entry["pending_status"] = "waiting_confirm"
                             # 保留表情ID
                             elif seg["type"] == "face":
                                 seg_entry["id"] = seg["data"].get("id", "")
@@ -302,6 +402,125 @@ class MessageStore:
             logger.debug(f"图片下载异常: {e}")
             return None
 
+    def _save_attachment(self, seg_type: str, seg_data: Dict[str, Any],
+                         message: Dict[str, Any], index: int) -> Dict[str, Any]:
+        """保存普通附件；超过阈值的大文件转入待确认"""
+        url = seg_data.get("url", "")
+        name = seg_data.get("name", "") or seg_data.get("file", "") or seg_type
+        known_size = self._parse_size(seg_data.get("size", 0))
+        remote_size = known_size or self._get_remote_size(url)
+        if remote_size and remote_size > self._large_file_threshold_bytes:
+            record = self._add_pending_large_file(seg_type, seg_data, message, index, remote_size)
+            return {"pending_file_id": record["file_id"]}
+
+        local_path = self._download_attachment(seg_type, seg_data, message, index, force=False)
+        return {"local_path": local_path} if local_path else {}
+
+    def _download_attachment_record(self, record: Dict[str, Any], force: bool = False) -> Optional[str]:
+        """下载待确认文件记录"""
+        return self._download_attachment(
+            record.get("segment_type", "file"),
+            {
+                "url": record.get("url", ""),
+                "name": record.get("name", ""),
+                "file": record.get("name", ""),
+                "size": record.get("size", 0)
+            },
+            record.get("message", {}),
+            record.get("index", 1),
+            force=force
+        )
+
+    def _download_attachment(self, seg_type: str, seg_data: Dict[str, Any],
+                             message: Dict[str, Any], index: int,
+                             force: bool = False) -> Optional[str]:
+        """下载文件/视频/语音附件"""
+        url = seg_data.get("url", "")
+        if not url:
+            return None
+        try:
+            date_str = self._message_date(message)
+            group_id = message.get("group_id", 0)
+            group_dir = os.path.join(self.data_dir, str(group_id))
+            category = self._attachment_category(seg_type)
+            save_dir = os.path.join(group_dir, "附件", category, date_str)
+            os.makedirs(save_dir, exist_ok=True)
+
+            original_name = seg_data.get("name", "") or seg_data.get("file", "") or seg_type
+            ext = self._guess_extension(original_name, url, seg_type)
+            url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            existing_path = self._find_existing_attachment(group_dir, category, url_hash)
+            if existing_path:
+                return f"/api/files/{os.path.relpath(existing_path, self.data_dir).replace(os.sep, '/')}"
+
+            filename = self._build_attachment_filename(message, index, original_name, url_hash, ext)
+            local_path = os.path.join(save_dir, filename)
+            if os.path.exists(local_path):
+                return f"/api/files/{os.path.relpath(local_path, self.data_dir).replace(os.sep, '/')}"
+
+            max_bytes = None if force else self._large_file_threshold_bytes
+            resp = requests.get(url, timeout=15, stream=True)
+            if resp.status_code != 200:
+                logger.warning(f"附件下载失败: HTTP {resp.status_code}")
+                return None
+            content_length = self._parse_size(resp.headers.get("Content-Length", 0))
+            if max_bytes and content_length and content_length > max_bytes:
+                self._add_pending_large_file(seg_type, seg_data, message, index, content_length)
+                return None
+
+            downloaded = 0
+            with open(local_path, "wb") as f:
+                for chunk in resp.iter_content(1024 * 1024):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if max_bytes and downloaded > max_bytes:
+                        f.close()
+                        try:
+                            os.remove(local_path)
+                        except OSError:
+                            pass
+                        self._add_pending_large_file(seg_type, seg_data, message, index, downloaded)
+                        return None
+                    f.write(chunk)
+            rel = os.path.relpath(local_path, self.data_dir).replace(os.sep, "/")
+            return f"/api/files/{rel}"
+        except Exception as e:
+            logger.debug(f"附件下载异常: {e}")
+            return None
+
+    def _add_pending_large_file(self, seg_type: str, seg_data: Dict[str, Any],
+                                message: Dict[str, Any], index: int,
+                                size: int) -> Dict[str, Any]:
+        """新增大文件待确认记录"""
+        url = seg_data.get("url", "")
+        name = seg_data.get("name", "") or seg_data.get("file", "") or seg_type
+        stable_key = f"{message.get('message_id', 0)}:{index}:{url or name}"
+        file_id = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()[:10]
+        with self._pending_lock:
+            if file_id in self._pending_files:
+                return self._pending_files[file_id]
+            record = {
+                "file_id": file_id,
+                "status": "waiting_confirm",
+                "segment_type": seg_type,
+                "name": name,
+                "url": url,
+                "size": size,
+                "size_text": self._format_size(size),
+                "index": index,
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "message": {k: v for k, v in message.items() if k != "raw"}
+            }
+            self._pending_files[file_id] = record
+            self._save_pending_files()
+        for callback in self._large_file_callbacks:
+            try:
+                callback(record)
+            except Exception as e:
+                logger.error(f"大文件待确认回调失败: {e}")
+        return record
+
     def _message_date(self, message: Dict[str, Any]) -> str:
         """获取消息日期"""
         dt = message.get("datetime", "")
@@ -330,6 +549,18 @@ class MessageStore:
         message_id = self._safe_filename_part(message.get("message_id", 0), 24)
         return f"{date_part}_{time_part}_QQ{user_id}_{nickname}_消息{message_id}_图{image_index}_{url_hash}{ext}"
 
+    def _build_attachment_filename(self, message: Dict[str, Any], index: int,
+                                   original_name: str, url_hash: str, ext: str) -> str:
+        """生成易读附件文件名"""
+        dt = message.get("datetime", "")
+        date_part = self._message_date(message).replace("-", "")
+        time_part = dt[11:19].replace(":", "") if len(dt) >= 19 else "000000"
+        user_id = self._safe_filename_part(message.get("user_id", 0), 20)
+        nickname = self._safe_filename_part(message.get("card") or message.get("nickname", "未知"), 20)
+        message_id = self._safe_filename_part(message.get("message_id", 0), 24)
+        base = self._safe_filename_part(os.path.splitext(original_name or "文件")[0], 36)
+        return f"{date_part}_{time_part}_QQ{user_id}_{nickname}_消息{message_id}_文件{index}_{base}_{url_hash}{ext}"
+
     def _find_existing_image(self, group_dir: str, url_hash: str) -> Optional[str]:
         """查找同一群内已缓存的相同图片"""
         images_root = os.path.join(group_dir, "附件", "图片")
@@ -344,6 +575,70 @@ class MessageStore:
         except OSError:
             return None
         return None
+
+    def _find_existing_attachment(self, group_dir: str, category: str, url_hash: str) -> Optional[str]:
+        """查找同一群内已缓存的相同附件"""
+        root = os.path.join(group_dir, "附件", category)
+        if not os.path.isdir(root):
+            return None
+        marker = f"_{url_hash}."
+        try:
+            for dirpath, _, filenames in os.walk(root):
+                for filename in filenames:
+                    if marker in filename:
+                        return os.path.join(dirpath, filename)
+        except OSError:
+            return None
+        return None
+
+    def _attachment_category(self, seg_type: str) -> str:
+        """附件分类目录名"""
+        return {
+            "file": "文件",
+            "video": "视频",
+            "voice": "语音"
+        }.get(seg_type, "文件")
+
+    def _guess_extension(self, name: str, url: str, seg_type: str) -> str:
+        """推断附件扩展名"""
+        ext = os.path.splitext(name or "")[1]
+        if ext and len(ext) <= 12:
+            return ext
+        url_ext = os.path.splitext(url.split("?")[0])[1]
+        if url_ext and len(url_ext) <= 12:
+            return url_ext
+        return {"video": ".mp4", "voice": ".amr", "file": ".bin"}.get(seg_type, ".bin")
+
+    def _parse_size(self, value: Any) -> int:
+        """解析大小字段为字节"""
+        try:
+            if value is None or value == "":
+                return 0
+            return int(float(value))
+        except (ValueError, TypeError):
+            return 0
+
+    def _format_size(self, size: int) -> str:
+        """格式化文件大小"""
+        size = self._parse_size(size)
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = float(size)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
+            value /= 1024
+
+    def _get_remote_size(self, url: str) -> int:
+        """通过HEAD获取远程文件大小"""
+        if not url:
+            return 0
+        try:
+            resp = requests.head(url, timeout=10, allow_redirects=True)
+            if resp.status_code < 400:
+                return self._parse_size(resp.headers.get("Content-Length", 0))
+        except Exception:
+            return 0
+        return 0
 
     def _add_to_index(self, group_id: int, message: Dict[str, Any]) -> None:
         """将消息添加到内存索引"""

@@ -238,6 +238,7 @@ table tr:hover { background: #f8f9ff; }
                 <button class="btn-secondary" onclick="openFolderPicker()">选择文件夹</button>
                 <button class="btn-primary" onclick="syncExportNow()">立即同步保存聊天记录</button>
                 <button class="btn-primary" onclick="transferExportDir()">一键转移聊天记录目录</button>
+                <button class="btn-secondary" onclick="loadPendingFiles()">待确认大文件</button>
                 <button class="btn-secondary" onclick="cleanupStorage()">清理/压缩旧存储</button>
                 <span id="systemConfigResult"></span>
             </div>
@@ -248,6 +249,14 @@ table tr:hover { background: #f8f9ff; }
                 </div>
                 <div class="help-text" id="folderCurrent"></div>
                 <div id="folderList" style="margin-top:8px;max-height:260px;overflow:auto"></div>
+            </div>
+            <div id="pendingFilesPanel" style="display:none;margin-top:12px;padding:12px;border:1px solid #e8e8e8;border-radius:8px;background:#fafafa">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                    <strong>待确认大文件</strong>
+                    <button class="btn-secondary" onclick="document.getElementById('pendingFilesPanel').style.display='none'">关闭</button>
+                </div>
+                <div class="help-text">超过1GB的文件会先暂停保存。你也可以私聊机器人回复：保存 文件ID 或 拒绝 文件ID。</div>
+                <div id="pendingFilesList" style="margin-top:8px"></div>
             </div>
         </div>
     </div>
@@ -786,6 +795,48 @@ async function transferExportDir() {
     }
 }
 
+async function loadPendingFiles() {
+    const panel = document.getElementById('pendingFilesPanel');
+    const list = document.getElementById('pendingFilesList');
+    panel.style.display = 'block';
+    list.innerHTML = '<div style="color:#999">正在加载...</div>';
+    const files = await api('/api/pending-files');
+    if (!files || files.length === 0) {
+        list.innerHTML = '<div class="empty">暂无待确认大文件</div>';
+        return;
+    }
+    list.innerHTML = files.map(f => {
+        const msg = f.message || {};
+        const safeId = String(f.file_id).replace(/'/g, "\\'");
+        return `<div style="padding:8px;border-bottom:1px solid #eee">
+            <div><strong>${String(f.name || '文件').replace(/</g,'&lt;')}</strong> <span style="color:#999">(${f.size_text || ''})</span></div>
+            <div class="help-text">文件ID：${f.file_id} · 状态：${f.status} · 群${msg.group_id || ''} · QQ:${msg.user_id || ''} · ${msg.datetime || ''}</div>
+            <div style="margin-top:6px">
+                <button class="btn-primary" onclick="confirmPendingFile('${safeId}')">确认保存</button>
+                <button class="btn-secondary" onclick="rejectPendingFile('${safeId}')">拒绝保存</button>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+async function confirmPendingFile(fileId) {
+    const resultEl = document.getElementById('systemConfigResult');
+    resultEl.innerHTML = '<span style="color:#999">正在保存大文件...</span>';
+    const result = await api('/api/pending-files/' + encodeURIComponent(fileId) + '/confirm', {method: 'POST'});
+    resultEl.innerHTML = result.success
+        ? '<span style="color:#52c41a">大文件已保存</span>'
+        : '<span style="color:#ff4d4f">保存失败：' + (result.error || '').replace(/</g,'&lt;') + '</span>';
+    loadPendingFiles();
+}
+
+async function rejectPendingFile(fileId) {
+    const result = await api('/api/pending-files/' + encodeURIComponent(fileId) + '/reject', {method: 'POST'});
+    document.getElementById('systemConfigResult').innerHTML = result.success
+        ? '<span style="color:#52c41a">已拒绝保存</span>'
+        : '<span style="color:#ff4d4f">操作失败：' + (result.error || '').replace(/</g,'&lt;') + '</span>';
+    loadPendingFiles();
+}
+
 async function cleanupStorage() {
     const resultEl = document.getElementById('systemConfigResult');
     resultEl.innerHTML = '<span style="color:#999">正在清理和压缩旧存储...</span>';
@@ -1113,6 +1164,21 @@ class WebPanel:
             except Exception as e:
                 return jsonify({"success": False, "error": str(e)}), 500
 
+        @self._app.route('/api/pending-files')
+        def api_pending_files():
+            """待确认大文件列表"""
+            return jsonify(self.store.get_pending_files())
+
+        @self._app.route('/api/pending-files/<file_id>/confirm', methods=['POST'])
+        def api_pending_file_confirm(file_id):
+            """确认保存大文件"""
+            return jsonify(self.store.confirm_pending_file(file_id))
+
+        @self._app.route('/api/pending-files/<file_id>/reject', methods=['POST'])
+        def api_pending_file_reject(file_id):
+            """拒绝保存大文件"""
+            return jsonify(self.store.reject_pending_file(file_id))
+
         @self._app.route('/api/groups/<int:group_id>/dates')
         def api_group_dates(group_id):
             dates = self.store.get_available_dates(group_id)
@@ -1151,6 +1217,16 @@ class WebPanel:
             directory = os.path.dirname(full_path)
             filename = os.path.basename(full_path)
             return send_from_directory(directory, filename)
+
+        @self._app.route('/api/files/<path:file_path>')
+        def api_serve_file(file_path):
+            """提供本地附件访问"""
+            full_path = os.path.join(self.store.data_dir, file_path)
+            if not os.path.exists(full_path):
+                return jsonify({"error": "文件不存在"}), 404
+            directory = os.path.dirname(full_path)
+            filename = os.path.basename(full_path)
+            return send_from_directory(directory, filename, as_attachment=True)
 
         @self._app.route('/api/ai/config', methods=['GET'])
         def api_ai_config_get():

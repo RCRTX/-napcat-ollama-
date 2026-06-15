@@ -43,6 +43,7 @@ class NapCatClient:
         self._max_reconnect_interval = 60
         self._current_reconnect_interval = self._reconnect_interval
         self._message_callbacks: List[Callable] = []
+        self._private_message_callbacks: List[Callable] = []
         self._connection_callbacks: List[Callable] = []
         self._disconnection_callbacks: List[Callable] = []
 
@@ -62,6 +63,10 @@ class NapCatClient:
     def on_message(self, callback: Callable) -> None:
         """注册消息回调函数"""
         self._message_callbacks.append(callback)
+
+    def on_private_message(self, callback: Callable) -> None:
+        """注册私聊消息回调函数"""
+        self._private_message_callbacks.append(callback)
 
     def on_connect(self, callback: Callable) -> None:
         """注册连接成功回调"""
@@ -154,6 +159,24 @@ class NapCatClient:
         """处理收到的消息"""
         message_type = data.get("message_type", "")
         group_id = data.get("group_id", 0)
+
+        # 私聊消息用于确认大文件保存等管理操作
+        if message_type == "private":
+            text = self._extract_plain_text(data.get("message", []), data.get("raw_message", ""))
+            parsed_private = {
+                "type": "private_message",
+                "user_id": data.get("user_id", 0),
+                "time": data.get("time", 0),
+                "datetime": datetime.fromtimestamp(data.get("time", time.time())).strftime("%Y-%m-%d %H:%M:%S"),
+                "text": text,
+                "raw": data
+            }
+            for callback in self._private_message_callbacks:
+                try:
+                    callback(parsed_private)
+                except Exception as e:
+                    logger.error(f"私聊消息回调执行失败: {e}")
+            return
 
         # 只处理群消息且在监控列表中的群
         if message_type != "group":
@@ -249,6 +272,7 @@ class NapCatClient:
         has_image = False
         has_face = False
         image_urls = []
+        file_count = 0
 
         for seg in message_segments:
             seg_type = seg.get("type", "")
@@ -312,7 +336,28 @@ class NapCatClient:
                 url = seg_data.get("url", "")
                 segments.append({
                     "type": "video",
-                    "data": {"url": url, "summary": "[视频]"}
+                    "data": {
+                        "url": url,
+                        "file": seg_data.get("file", ""),
+                        "name": seg_data.get("name", seg_data.get("file", "")),
+                        "size": seg_data.get("size", 0),
+                        "summary": "[视频]"
+                    }
+                })
+
+            elif seg_type == "file":
+                file_count += 1
+                name = seg_data.get("name", "") or seg_data.get("file", "") or "文件"
+                segments.append({
+                    "type": "file",
+                    "data": {
+                        "url": seg_data.get("url", ""),
+                        "file": seg_data.get("file", ""),
+                        "name": name,
+                        "size": seg_data.get("size", 0),
+                        "file_id": seg_data.get("file_id", ""),
+                        "summary": f"[文件:{name}]"
+                    }
                 })
 
             elif seg_type == "forward":
@@ -348,6 +393,8 @@ class NapCatClient:
             content_summary += f" [包含{len(image_urls)}张图片]"
         if has_face:
             content_summary += " [包含表情]"
+        if file_count:
+            content_summary += f" [包含{file_count}个文件]"
 
         # 时间格式化
         try:
@@ -384,6 +431,16 @@ class NapCatClient:
             },
             "raw": data
         }
+
+    def _extract_plain_text(self, message_segments: List[Dict[str, Any]], raw_message: str = "") -> str:
+        """从消息段中提取纯文本"""
+        parts = []
+        for seg in message_segments or []:
+            if seg.get("type") == "text":
+                text = seg.get("data", {}).get("text", "").strip()
+                if text:
+                    parts.append(text)
+        return " ".join(parts).strip() or raw_message.strip()
 
     def _on_error(self, ws, error) -> None:
         """WebSocket错误回调"""
@@ -443,4 +500,36 @@ class NapCatClient:
 
         except Exception as e:
             logger.error(f"发送消息异常: {e}")
+            return False
+
+    def send_private_message(self, user_id: int, message: str) -> bool:
+        """通过HTTP API发送私聊消息"""
+        if not self.http_url:
+            logger.warning("未配置HTTP API地址，无法发送私聊消息")
+            return False
+
+        try:
+            import requests
+            url = f"{self.http_url}/send_private_msg"
+            headers = {}
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+
+            payload = {
+                "user_id": user_id,
+                "message": message
+            }
+
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "ok" or data.get("retcode") == 0:
+                    logger.info(f"已向用户 {user_id} 发送私聊消息")
+                    return True
+                logger.error(f"发送私聊消息失败: {data}")
+                return False
+            logger.error(f"发送私聊消息HTTP错误: {resp.status_code}")
+            return False
+        except Exception as e:
+            logger.error(f"发送私聊消息异常: {e}")
             return False
