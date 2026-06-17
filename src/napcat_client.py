@@ -523,13 +523,47 @@ class NapCatClient:
             resp = requests.post(url, json=payload, headers=headers, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                if data.get("status") == "ok" or data.get("retcode") == 0:
+                if data.get("status") == "ok":
                     logger.info(f"已向用户 {user_id} 发送私聊消息")
                     return True
-                logger.error(f"发送私聊消息失败: {data}")
+                else:
+                    logger.error(f"发送私聊消息失败: {data}")
+                    return False
+            else:
+                logger.error(f"发送私聊消息HTTP错误: {resp.status_code}")
                 return False
-            logger.error(f"发送私聊消息HTTP错误: {resp.status_code}")
-            return False
+
         except Exception as e:
             logger.error(f"发送私聊消息异常: {e}")
             return False
+
+    def get_login_info(self) -> Dict[str, Any]:
+        """获取机器人登录信息（QQ号等）"""
+        if not self.http_url:
+            return {}
+        try:
+            import requests
+            url = f"{self.http_url}/get_login_info"
+            headers = {}
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            resp = requests.get(url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "ok":
+                    return data.get("data", {})
+        except Exception as e:
+            logger.error(f"获取登录信息失败: {e}")
+        return {}
+
+    @property
+    def bot_qq(self) -> str:
+        """获取机器人QQ号（缓存）"""
+        if not hasattr(self, '_bot_qq'):
+            self._bot_qq = ""
+        if not self._bot_qq:
+            info = self.get_login_info()
+            self._bot_qq = str(info.get("user_id", ""))
+            if self._bot_qq:
+                logger.info(f"机器人QQ号: {self._bot_qq}")
+        return self._bot_qq

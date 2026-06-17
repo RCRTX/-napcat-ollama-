@@ -1073,3 +1073,163 @@ class ComplianceManager:
             logger.info("配置已保存到文件")
         except Exception as e:
             logger.error(f"保存配置文件失败: {e}")
+
+
+class ChatCompanion:
+    """陪聊功能：被@时使用二次审核AI生成回复"""
+
+    def __init__(self, api_base: str, api_key: str, model: str,
+                 system_prompt: str = "",
+                 bot_name: str = "小助手",
+                 cooldown_seconds: int = 10):
+        self.api_base = api_base
+        self.api_key = api_key
+        self.model = model
+        self.bot_name = bot_name
+        self.cooldown_seconds = cooldown_seconds
+        self.system_prompt = system_prompt or (
+            f"你是群聊里的{bot_name}，性格活泼友好、幽默风趣。"
+            "别人@你时你会积极回应，回答要简短有趣，不要超过100字。"
+            "不要输出JSON，直接用自然语言回复。"
+        )
+        self._client = None
+        self._last_reply_time: Dict[int, float] = {}  # group_id -> timestamp
+        self._init_client()
+
+    def _init_client(self) -> None:
+        try:
+            self._client = OpenAI(
+                base_url=self.api_base,
+                api_key=self.api_key,
+                timeout=30
+            )
+            logger.info(f"陪聊AI初始化: base={self.api_base}, model={self.model}")
+        except Exception as e:
+            logger.error(f"陪聊AI初始化失败: {e}")
+            self._client = None
+
+    def _check_cooldown(self, group_id: int) -> bool:
+        """检查冷却时间，避免频繁回复"""
+        now = time.time()
+        last = self._last_reply_time.get(group_id, 0)
+        if now - last < self.cooldown_seconds:
+            return False
+        self._last_reply_time[group_id] = now
+        return True
+
+    def is_mentioned(self, message: Dict[str, Any], bot_qq: str) -> bool:
+        """检测消息是否@了机器人"""
+        segments = message.get("content", {}).get("segments", [])
+        for seg in segments:
+            if seg.get("type") == "at":
+                qq = seg.get("data", {}).get("qq", "")
+                if qq == bot_qq or qq == "all":
+                    return True
+        return False
+
+    def generate_reply(self, message: Dict[str, Any],
+                       recent_context: List[Dict] = None) -> Optional[str]:
+        """生成陪聊回复"""
+        if not self._client:
+            return None
+
+        group_id = message.get("group_id", 0)
+        if not self._check_cooldown(group_id):
+            logger.debug(f"陪聊冷却中，跳过群 {group_id}")
+            return None
+
+        sender = message.get("card") or message.get("nickname", "未知用户")
+        text = self._extract_text(message)
+        if not text:
+            return None
+
+        # 构建上下文
+        context_lines = []
+        if recent_context:
+            for ctx_msg in recent_context[-6:]:
+                ctx_sender = ctx_msg.get("card") or ctx_msg.get("nickname", "未知")
+                ctx_text = self._extract_text(ctx_msg)
+                if ctx_text:
+                    context_lines.append(f"{ctx_sender}: {ctx_text}")
+
+        context_str = "\n".join(context_lines) if context_lines else "无"
+
+        prompt = f"""群聊上下文（最近几条消息）：
+{context_str}
+
+{sender} @了你：{text}
+
+请用简短有趣的方式回复{sender}，不要超过100字。不要输出JSON。"""
+
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.8,
+                max_tokens=200
+            )
+            reply = response.choices[0].message.content.strip()
+            if reply:
+                logger.info(f"陪聊回复群 {group_id}: {reply[:50]}...")
+                return reply
+        except Exception as e:
+            logger.error(f"陪聊AI回复失败: {e}")
+
+        return None
+
+    def _extract_text(self, message: Dict[str, Any]) -> str:
+        """提取消息文字"""
+        segments = message.get("content", {}).get("segments", [])
+        parts = []
+        for seg in segments:
+            if seg.get("type") == "text":
+                text = seg.get("data", {}).get("text", "")
+                if text:
+                    parts.append(text.strip())
+        return " ".join(parts).strip()
+
+    def test_connection(self) -> Dict[str, Any]:
+        """测试连接"""
+        result = {"success": False, "error": "", "model": self.model, "base": self.api_base}
+        if not self._client:
+            result["error"] = "客户端未初始化"
+            return result
+        try:
+            resp = self._client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": "你好，请用一句话介绍你自己"}],
+                temperature=0.8,
+                max_tokens=100
+            )
+            result["success"] = True
+            result["response"] = resp.choices[0].message.content.strip()
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    def reload_config(self, api_base: str = None, api_key: str = None,
+                      model: str = None, system_prompt: str = None,
+                      bot_name: str = None, cooldown_seconds: int = None) -> bool:
+        """重新加载配置"""
+        changed = False
+        if api_base and api_base != self.api_base:
+            self.api_base = api_base
+            changed = True
+        if api_key and api_key != self.api_key:
+            self.api_key = api_key
+            changed = True
+        if model and model != self.model:
+            self.model = model
+            changed = True
+        if system_prompt is not None and system_prompt != self.system_prompt:
+            self.system_prompt = system_prompt
+        if bot_name is not None and bot_name != self.bot_name:
+            self.bot_name = bot_name
+        if cooldown_seconds is not None and cooldown_seconds != self.cooldown_seconds:
+            self.cooldown_seconds = cooldown_seconds
+        if changed:
+            self._init_client()
+        return changed

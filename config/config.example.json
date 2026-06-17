@@ -38,6 +38,15 @@
         "model": "qwen2.5",
         "system_prompt": "你是严格、谨慎、低误报的QQ群聊合规二次复核员。必须只输出JSON。"
     },
+    "chat_companion": {
+        "enabled": false,
+        "api_base": "",
+        "api_key": "",
+        "model": "",
+        "system_prompt": "",
+        "bot_name": "小助手",
+        "cooldown_seconds": 10
+    },
     "alert": {
         "qq": {
             "enabled": false,

@@ -18,7 +18,7 @@ from src.config_loader import Config
 from src.logger import setup_logger
 from src.napcat_client import NapCatClient
 from src.message_store import MessageStore
-from src.compliance import ComplianceManager
+from src.compliance import ComplianceManager, ChatCompanion
 from src.alert_manager import AlertManager
 from src.web_panel import WebPanel
 from src.history_fetcher import HistoryFetcher
@@ -72,6 +72,20 @@ class QQMonitor:
         # 合规管理器
         self.compliance = ComplianceManager(self.config._config, config_path=self.config_path)
 
+        # 陪聊功能（使用二次审核AI配置）
+        chat_cfg = self.config._config.get("chat_companion", {})
+        secondary_cfg = self.config._config.get("secondary_ai_review", {})
+        self.companion = None
+        if chat_cfg.get("enabled", False):
+            self.companion = ChatCompanion(
+                api_base=chat_cfg.get("api_base") or secondary_cfg.get("api_base", "http://localhost:11434/v1"),
+                api_key=chat_cfg.get("api_key") or secondary_cfg.get("api_key", "ollama"),
+                model=chat_cfg.get("model") or secondary_cfg.get("model", "qwen2.5"),
+                system_prompt=chat_cfg.get("system_prompt", ""),
+                bot_name=chat_cfg.get("bot_name", "小助手"),
+                cooldown_seconds=chat_cfg.get("cooldown_seconds", 10)
+            )
+
         # 告警管理器
         self.alert = AlertManager(self.config._config)
 
@@ -84,7 +98,8 @@ class QQMonitor:
         self.web_panel.set_components(
             napcat_client=self.napcat,
             compliance_manager=self.compliance,
-            alert_manager=self.alert
+            alert_manager=self.alert,
+            companion=self.companion
         )
 
         # 注册消息处理回调
@@ -137,6 +152,20 @@ class QQMonitor:
                 f"类型:{violation.get('type')} "
                 f"级别:{violation.get('severity')}"
             )
+
+        # 陪聊：检测是否@机器人
+        if self.companion:
+            try:
+                bot_qq = self.napcat.bot_qq
+                if bot_qq and self.companion.is_mentioned(message, bot_qq):
+                    group_id = message.get("group_id", 0)
+                    # 获取最近上下文
+                    recent = self.store._index.get(group_id, [])[-6:]
+                    reply = self.companion.generate_reply(message, recent)
+                    if reply:
+                        self.napcat.send_group_message(group_id, reply)
+            except Exception as e:
+                logger.error(f"陪聊处理失败: {e}")
 
     def _on_violation_detected(self, violation: dict) -> None:
         """违规检测回调"""

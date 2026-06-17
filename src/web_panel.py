@@ -115,6 +115,7 @@ table tr:hover { background: #f8f9ff; }
         <button class="tab" onclick="switchTab('settings')">系统配置</button>
         <button class="tab" onclick="switchTab('aisettings')">AI设置</button>
         <button class="tab" onclick="switchTab('secondaryai')">二次审核AI</button>
+        <button class="tab" onclick="switchTab('companion')">陪聊设置</button>
     </div>
 
     <!-- 数据概览 -->
@@ -339,6 +340,43 @@ table tr:hover { background: #f8f9ff; }
             <div id="secondaryAiResult" style="margin-top:15px"></div>
         </div>
     </div>
+
+    <div class="panel" id="panel-companion">
+        <div class="card">
+            <h3>陪聊设置</h3>
+            <p style="color:#666;font-size:13px;margin-bottom:12px">当群成员@机器人时，AI会自动生成回复。使用二次审核AI的模型配置。</p>
+            <div class="toolbar">
+                <label style="margin-right:10px">
+                    <input type="checkbox" id="companionEnabled">
+                    启用陪聊
+                </label>
+                <button class="btn-primary" onclick="saveCompanionConfig()">保存配置</button>
+                <button class="btn-secondary" onclick="testCompanionConnection()">测试连接</button>
+            </div>
+            <table style="max-width:760px">
+                <tr><td style="padding:10px;font-weight:bold;width:150px">机器人昵称</td>
+                    <td style="padding:10px"><input type="text" id="companionBotName" style="width:200px;padding:8px;border:1px solid #d9d9d9;border-radius:6px" placeholder="小助手"></td></tr>
+                <tr><td style="padding:10px;font-weight:bold">API地址</td>
+                    <td style="padding:10px"><input type="text" id="companionApiBase" style="width:100%;padding:8px;border:1px solid #d9d9d9;border-radius:6px" placeholder="留空则使用二次审核AI的API地址"></td></tr>
+                <tr><td style="padding:10px;font-weight:bold">API Key</td>
+                    <td style="padding:10px"><input type="password" id="companionApiKey" style="width:100%;padding:8px;border:1px solid #d9d9d9;border-radius:6px" placeholder="留空则使用二次审核AI的Key"></td></tr>
+                <tr><td style="padding:10px;font-weight:bold">模型名称</td>
+                    <td style="padding:10px"><input type="text" id="companionModel" style="width:100%;padding:8px;border:1px solid #d9d9d9;border-radius:6px" placeholder="留空则使用二次审核AI的模型"></td></tr>
+                <tr><td style="padding:10px;font-weight:bold">回复冷却(秒)</td>
+                    <td style="padding:10px">
+                        <input type="number" id="companionCooldown" style="width:100px;padding:8px;border:1px solid #d9d9d9;border-radius:6px" min="1" max="300" value="10">
+                        <div class="help-text">同一群内两次回复的最小间隔，避免刷屏</div>
+                    </td></tr>
+                <tr><td style="padding:10px;font-weight:bold">系统提示词</td>
+                    <td style="padding:10px">
+                        <textarea id="companionPrompt" rows="4" style="width:100%;padding:8px;border:1px solid #d9d9d9;border-radius:6px;font-size:13px" placeholder="留空使用默认提示词"></textarea>
+                        <div class="help-text">定义AI的性格和回复风格，留空则使用默认的活泼友好风格</div>
+                    </td></tr>
+            </table>
+            <div id="companionTestResult" style="margin-top:15px"></div>
+        </div>
+    </div>
+
 </div>
 
 <script>
@@ -364,6 +402,7 @@ function switchTab(name) {
     if (name === 'settings') loadSystemConfig();
     if (name === 'aisettings') loadAISettings();
     if (name === 'secondaryai') loadSecondaryAISettings();
+    if (name === 'companion') loadCompanionSettings();
 }
 
 async function api(url, opts = {}) {
@@ -760,6 +799,52 @@ async function testSecondaryAIConnection() {
     }
 }
 
+async function loadCompanionSettings() {
+    const data = await api('/api/companion/config');
+    if (data.error) return;
+    document.getElementById('companionEnabled').checked = !!data.enabled;
+    document.getElementById('companionBotName').value = data.bot_name || '小助手';
+    document.getElementById('companionApiBase').value = data.api_base || '';
+    document.getElementById('companionApiKey').value = data.api_key || '';
+    document.getElementById('companionModel').value = data.model || '';
+    document.getElementById('companionCooldown').value = data.cooldown_seconds || 10;
+    document.getElementById('companionPrompt').value = data.system_prompt || '';
+}
+
+async function saveCompanionConfig() {
+    const config = {
+        enabled: document.getElementById('companionEnabled').checked,
+        bot_name: document.getElementById('companionBotName').value || '小助手',
+        api_base: document.getElementById('companionApiBase').value,
+        api_key: document.getElementById('companionApiKey').value,
+        model: document.getElementById('companionModel').value,
+        cooldown_seconds: parseInt(document.getElementById('companionCooldown').value) || 10,
+        system_prompt: document.getElementById('companionPrompt').value
+    };
+    const result = await api('/api/companion/config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(config)
+    });
+    if (result.success) {
+        document.getElementById('companionTestResult').innerHTML = '<div style="padding:10px;background:#f6ffed;border:1px solid #b7eb8f;border-radius:6px;color:#52c41a">陪聊配置已保存</div>';
+    } else {
+        document.getElementById('companionTestResult').innerHTML = '<div style="padding:10px;background:#fff2f0;border:1px solid #ffccc7;border-radius:6px;color:#ff4d4f">保存失败: ' + (result.error || '').replace(/</g,'&lt;') + '</div>';
+    }
+}
+
+async function testCompanionConnection() {
+    const el = document.getElementById('companionTestResult');
+    el.innerHTML = '<div style="padding:10px;color:#999">正在测试陪聊AI连接...</div>';
+    await saveCompanionConfig();
+    const result = await api('/api/companion/test', {method: 'POST'});
+    if (result.success) {
+        el.innerHTML = '<div style="padding:10px;background:#f6ffed;border:1px solid #b7eb8f;border-radius:6px;color:#52c41a">连接成功! AI回复: ' + (result.response || '').replace(/</g,'&lt;') + '</div>';
+    } else {
+        el.innerHTML = '<div style="padding:10px;background:#fff2f0;border:1px solid #ffccc7;border-radius:6px;color:#ff4d4f">连接失败: ' + (result.error || '').replace(/</g,'&lt;') + '</div>';
+    }
+}
+
 function parseIdList(text) {
     return (text || '').split(/[,，\s]+/)
         .map(x => x.trim())
@@ -1015,7 +1100,7 @@ class WebPanel:
         self._register_routes()
 
     def set_components(self, napcat_client=None, compliance_manager=None,
-                       alert_manager=None, exporter=None):
+                       alert_manager=None, exporter=None, companion=None):
         """设置外部组件引用"""
         if napcat_client is not None:
             self._napcat_client = napcat_client
@@ -1025,6 +1110,8 @@ class WebPanel:
             self._alert_manager = alert_manager
         if exporter is not None:
             self._exporter = exporter
+        if companion is not None:
+            self._companion = companion
 
     def _register_routes(self) -> None:
         """注册路由"""
@@ -1371,6 +1458,29 @@ class WebPanel:
                 result = self._compliance_manager.test_secondary_ai_connection()
                 return jsonify(result)
             return jsonify({"error": "合规管理器未初始化"}), 400
+
+        @self._app.route('/api/companion/config', methods=['GET'])
+        def api_companion_config_get():
+            companion = getattr(self, '_companion', None)
+            if not companion:
+                return jsonify({"enabled": False, "bot_name": "小助手", "api_base": "", "api_key": "", "model": "", "cooldown_seconds": 10, "system_prompt": ""})
+            return jsonify({"enabled": True, "bot_name": companion.bot_name, "api_base": companion.api_base, "api_key": companion.api_key, "model": companion.model, "cooldown_seconds": companion.cooldown_seconds, "system_prompt": companion.system_prompt})
+
+        @self._app.route('/api/companion/config', methods=['POST'])
+        def api_companion_config_post():
+            data = request.get_json(force=True)
+            companion = getattr(self, '_companion', None)
+            if not companion:
+                return jsonify({"success": False, "error": "陪聊功能未启用，请先在config.json中设置 chat_companion.enabled=true"})
+            companion.reload_config(api_base=data.get('api_base'), api_key=data.get('api_key'), model=data.get('model'), system_prompt=data.get('system_prompt'), bot_name=data.get('bot_name'), cooldown_seconds=data.get('cooldown_seconds'))
+            return jsonify({"success": True})
+
+        @self._app.route('/api/companion/test', methods=['POST'])
+        def api_companion_test():
+            companion = getattr(self, '_companion', None)
+            if not companion:
+                return jsonify({"success": False, "error": "陪聊功能未启用"})
+            return jsonify(companion.test_connection())
 
         @self._app.route('/api/ai/test', methods=['POST'])
         def api_ai_test():
