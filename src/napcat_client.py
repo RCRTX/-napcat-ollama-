@@ -45,6 +45,7 @@ class NapCatClient:
         self._message_callbacks: List[Callable] = []
         self._private_message_callbacks: List[Callable] = []
         self._connection_callbacks: List[Callable] = []
+        self._bot_qq = ""
         self._disconnection_callbacks: List[Callable] = []
 
         # 消息缓冲区（用于暂存未处理的消息）
@@ -140,6 +141,12 @@ class NapCatClient:
         try:
             data = json.loads(message)
             post_type = data.get("post_type", "")
+
+            # 自动从消息中捕获机器人QQ号
+            self_id = data.get("self_id", "")
+            if self_id and not self._bot_qq:
+                self._bot_qq = str(self_id)
+                logger.info(f"从WebSocket消息中获取到机器人QQ号: {self._bot_qq}")
 
             if post_type == "message":
                 self._handle_message(data)
@@ -482,7 +489,7 @@ class NapCatClient:
 
             payload = {
                 "group_id": group_id,
-                "message": message
+                "message": [{"type": "text", "data": {"text": message}}]
             }
 
             resp = requests.post(url, json=payload, headers=headers, timeout=10)
@@ -517,7 +524,7 @@ class NapCatClient:
 
             payload = {
                 "user_id": user_id,
-                "message": message
+                "message": [{"type": "text", "data": {"text": message}}]
             }
 
             resp = requests.post(url, json=payload, headers=headers, timeout=10)
