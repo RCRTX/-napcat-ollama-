@@ -1095,6 +1095,7 @@ class ChatCompanion:
         self._client = None
         self._last_reply_time: Dict[int, float] = {}  # group_id -> timestamp
         self._init_client()
+        logger.warning(f"陪聊功能已初始化: bot_name={self.bot_name}, model={self.model}, base={self.api_base}, cooldown={self.cooldown_seconds}s")
 
     def _init_client(self) -> None:
         try:
@@ -1120,10 +1121,12 @@ class ChatCompanion:
     def is_mentioned(self, message: Dict[str, Any], bot_qq: str) -> bool:
         """检测消息是否@了机器人"""
         segments = message.get("content", {}).get("segments", [])
+        bot_qq_str = str(bot_qq)
         for seg in segments:
             if seg.get("type") == "at":
-                qq = seg.get("data", {}).get("qq", "")
-                if qq == bot_qq or qq == "all":
+                # 兼容两种格式：seg["data"]["qq"] 和 seg["qq"]
+                qq = str(seg.get("data", {}).get("qq", "") or seg.get("qq", ""))
+                if qq == bot_qq_str or qq == "all":
                     return True
         return False
 
@@ -1131,16 +1134,19 @@ class ChatCompanion:
                        recent_context: List[Dict] = None) -> Optional[str]:
         """生成陪聊回复"""
         if not self._client:
+            logger.warning("陪聊：AI客户端未初始化")
             return None
 
         group_id = message.get("group_id", 0)
         if not self._check_cooldown(group_id):
-            logger.debug(f"陪聊冷却中，跳过群 {group_id}")
+            logger.warning(f"陪聊冷却中，跳过群 {group_id}")
             return None
 
         sender = message.get("card") or message.get("nickname", "未知用户")
         text = self._extract_text(message)
+        logger.warning(f"陪聊调试：sender={sender}, text='{text}', segments={message.get('content', {}).get('segments', [])}")
         if not text:
+            logger.warning("陪聊：提取到的文字为空，跳过")
             return None
 
         # 构建上下文
@@ -1176,8 +1182,9 @@ class ChatCompanion:
                 logger.info(f"陪聊回复群 {group_id}: {reply[:50]}...")
                 return reply
         except Exception as e:
-            logger.error(f"陪聊AI回复失败: {e}")
+            logger.warning(f"陪聊AI回复失败: {e}")
 
+        logger.warning(f"陪聊：AI返回空回复，model={self.model}")
         return None
 
     def _extract_text(self, message: Dict[str, Any]) -> str:
@@ -1186,7 +1193,8 @@ class ChatCompanion:
         parts = []
         for seg in segments:
             if seg.get("type") == "text":
-                text = seg.get("data", {}).get("text", "")
+                # 兼容两种格式：seg["data"]["text"] 和 seg["text"]
+                text = seg.get("data", {}).get("text", "") or seg.get("text", "")
                 if text:
                     parts.append(text.strip())
         return " ".join(parts).strip()
@@ -1233,3 +1241,65 @@ class ChatCompanion:
         if changed:
             self._init_client()
         return changed
+
+
+class Repeater:
+    """复读功能：当同一群内2人以上发送相同消息时，机器人跟发一次"""
+
+    def __init__(self, cooldown_seconds: int = 30):
+        self.cooldown_seconds = cooldown_seconds
+        # {group_id: {text: {"users": set(), "sent": bool, "last_time": float}}}
+        self._groups: Dict[int, Dict[str, Dict]] = {}
+
+    def check_and_repeat(self, message: Dict[str, Any]) -> Optional[int]:
+        """检查是否需要复读，返回要复读的group_id或None"""
+        group_id = message.get("group_id", 0)
+        if not group_id:
+            return None
+
+        user_id = message.get("user_id", 0)
+        text = self._extract_text(message)
+        if not text or len(text) > 200:
+            return None
+
+        now = time.time()
+
+        # 初始化群记录
+        if group_id not in self._groups:
+            self._groups[group_id] = {}
+
+        group = self._groups[group_id]
+
+        # 清理过期记录
+        expired = [k for k, v in group.items() if now - v.get("last_time", 0) > self.cooldown_seconds]
+        for k in expired:
+            del group[k]
+
+        # 标准化文本用于比较
+        key = text.strip()
+
+        if key not in group:
+            group[key] = {"users": set(), "sent": False, "last_time": now}
+
+        record = group[key]
+        record["last_time"] = now
+        record["users"].add(user_id)
+
+        # 2人以上且未发送过
+        if len(record["users"]) >= 2 and not record["sent"]:
+            record["sent"] = True
+            logger.info(f"复读触发：群{group_id}，{len(record['users'])}人发送了'{text[:30]}'")
+            return group_id
+
+        return None
+
+    def _extract_text(self, message: Dict[str, Any]) -> str:
+        """提取消息文字"""
+        segments = message.get("content", {}).get("segments", [])
+        parts = []
+        for seg in segments:
+            if seg.get("type") == "text":
+                text = seg.get("data", {}).get("text", "") or seg.get("text", "")
+                if text:
+                    parts.append(text.strip())
+        return " ".join(parts).strip()

@@ -18,7 +18,7 @@ from src.config_loader import Config
 from src.logger import setup_logger
 from src.napcat_client import NapCatClient
 from src.message_store import MessageStore
-from src.compliance import ComplianceManager, ChatCompanion
+from src.compliance import ComplianceManager, ChatCompanion, Repeater
 from src.alert_manager import AlertManager
 from src.web_panel import WebPanel
 from src.history_fetcher import HistoryFetcher
@@ -89,6 +89,9 @@ class QQMonitor:
         # 告警管理器
         self.alert = AlertManager(self.config._config)
 
+        # 复读器
+        self.repeater = Repeater(cooldown_seconds=30)
+
         # Web面板
         self.web_panel = WebPanel(
             store=self.store,
@@ -153,24 +156,46 @@ class QQMonitor:
                 f"级别:{violation.get('severity')}"
             )
 
+        # 复读检测
+        try:
+            repeat_group = self.repeater.check_and_repeat(message)
+            if repeat_group:
+                text = self.repeater._extract_text(message)
+                if text:
+                    self.napcat.send_group_message(repeat_group, text)
+        except Exception as e:
+            logger.error(f"复读处理失败: {e}")
+
         # 陪聊：检测是否@机器人
         if self.companion:
             try:
                 bot_qq = self.napcat.bot_qq
                 if not bot_qq:
-                    logger.debug(f"陪聊跳过：机器人QQ号尚未获取到")
-                elif self.companion.is_mentioned(message, bot_qq):
-                    group_id = message.get("group_id", 0)
-                    logger.info(f"陪聊触发：群{group_id}，用户{message.get('nickname')}@了机器人")
-                    # 获取最近上下文
-                    recent = self.store._index.get(group_id, [])[-6:]
-                    reply = self.companion.generate_reply(message, recent)
-                    if reply:
-                        self.napcat.send_group_message(group_id, reply)
-                    else:
-                        logger.debug(f"陪聊：AI未生成回复")
+                    logger.warning(f"陪聊跳过：机器人QQ号尚未获取到（等待WebSocket消息）")
+                else:
+                    # 调试：打印消息中的at段
+                    segs = message.get("content", {}).get("segments", [])
+                    at_segs = [s for s in segs if s.get("type") == "at"]
+                    if at_segs:
+                        logger.warning(f"陪聊调试：发现at段={at_segs}, bot_qq={bot_qq}(type={type(bot_qq).__name__})")
+                    if self.companion.is_mentioned(message, bot_qq):
+                        group_id = message.get("group_id", 0)
+                        logger.warning(f"陪聊触发！群{group_id}，用户{message.get('nickname')}@了机器人")
+                        # 获取最近上下文
+                        recent = self.store._index.get(group_id, [])[-6:]
+                        reply = self.companion.generate_reply(message, recent)
+                        if reply:
+                            logger.warning(f"陪聊回复：{reply[:50]}")
+                            self.napcat.send_group_message(group_id, reply)
+                        else:
+                            logger.warning(f"陪聊：AI未生成回复")
             except Exception as e:
                 logger.error(f"陪聊处理失败: {e}")
+        else:
+            # companion未初始化，只打一次
+            if not hasattr(self, '_companion_warned'):
+                self._companion_warned = True
+                logger.warning("陪聊功能未启用（chat_companion.enabled=false或配置缺失）")
 
     def _on_violation_detected(self, violation: dict) -> None:
         """违规检测回调"""

@@ -138,6 +138,15 @@ class NapCatClient:
 
     def _on_ws_message(self, ws, message: str) -> None:
         """收到WebSocket消息回调"""
+        # 调试：记录所有WS消息
+        try:
+            quick = json.loads(message)
+            pt = quick.get("post_type", "?")
+            if pt != "meta_event":  # 不记录心跳
+                logger.warning(f"WS原始消息: post_type={pt}, raw={message[:300]}")
+        except:
+            logger.warning(f"WS非JSON消息: {message[:200]}")
+
         try:
             data = json.loads(message)
             post_type = data.get("post_type", "")
@@ -147,6 +156,13 @@ class NapCatClient:
             if self_id and not self._bot_qq:
                 self._bot_qq = str(self_id)
                 logger.info(f"从WebSocket消息中获取到机器人QQ号: {self._bot_qq}")
+
+            # 调试：记录收到的消息类型
+            if post_type == "message":
+                msg_type = data.get("message_type", "")
+                group_id = data.get("group_id", "?")
+                sender = data.get("sender", {}).get("nickname", "") or data.get("sender", {}).get("card", "")
+                logger.warning(f"WS收到消息: type={msg_type}, group={group_id}, sender={sender}")
 
             if post_type == "message":
                 self._handle_message(data)
