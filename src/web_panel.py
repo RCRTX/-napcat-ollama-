@@ -1473,6 +1473,24 @@ class WebPanel:
             if not companion:
                 return jsonify({"success": False, "error": "陪聊功能未启用，请先在config.json中设置 chat_companion.enabled=true"})
             companion.reload_config(api_base=data.get('api_base'), api_key=data.get('api_key'), model=data.get('model'), system_prompt=data.get('system_prompt'), bot_name=data.get('bot_name'), cooldown_seconds=data.get('cooldown_seconds'))
+            # 持久化到config.json
+            if self._compliance_manager:
+                self._compliance_manager._config.setdefault('chat_companion', {})
+                cc = self._compliance_manager._config['chat_companion']
+                cc['enabled'] = True
+                if data.get('bot_name'):
+                    cc['bot_name'] = data['bot_name']
+                if data.get('api_base'):
+                    cc['api_base'] = data['api_base']
+                if data.get('api_key'):
+                    cc['api_key'] = data['api_key']
+                if data.get('model'):
+                    cc['model'] = data['model']
+                if data.get('system_prompt') is not None:
+                    cc['system_prompt'] = data['system_prompt']
+                if data.get('cooldown_seconds'):
+                    cc['cooldown_seconds'] = data['cooldown_seconds']
+                self._compliance_manager._save_config()
             return jsonify({"success": True})
 
         @self._app.route('/api/companion/test', methods=['POST'])

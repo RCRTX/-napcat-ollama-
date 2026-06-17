@@ -1259,7 +1259,7 @@ class Repeater:
 
         user_id = message.get("user_id", 0)
         text = self._extract_text(message)
-        if not text or len(text) > 200:
+        if not text or len(text) > 500:
             return None
 
         now = time.time()
