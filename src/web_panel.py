@@ -541,12 +541,46 @@ function renderAlertItem(a) {
     const userId = msg.user_id || a.user_id || '?';
     const nickname = msg.card || msg.nickname || a.card || a.nickname || '未知';
     const msgTime = msg.datetime || a.datetime || '';
-    const content = a.content_preview || msg.content?.text || a.matched_word || '';
+
+    // 优先显示原始消息全文，AI摘要作为补充
+    const originalText = msg.content?.text || '';
+    const aiPreview = a.content_preview || '';
+    const matchedWord = a.matched_word || '';
+    const showOriginal = originalText && originalText !== aiPreview;
+    const content = originalText || aiPreview || matchedWord || '';
+
+    // 构建媒体HTML（图片等）
+    let mediaHtml = '';
+    const segs = msg.content?.segments || [];
+    segs.forEach(s => {
+        if (s.type === 'image') {
+            const imgSrc = s.local_path || s.url || '';
+            if (imgSrc) {
+                mediaHtml += `<div class="msg-img-wrap"><img class="msg-img" src="${imgSrc}" onclick="window.open(this.src)" onerror="this.style.display='none'" style="max-height:120px;max-width:200px;border-radius:4px;margin-top:4px"></div>`;
+            }
+        } else if (s.type === 'face') {
+            mediaHtml += `<span class="msg-media-tag">[表情]</span>`;
+        } else if (s.type === 'reply') {
+            mediaHtml += `<div class="msg-reply" style="font-size:12px;color:#888;border-left:2px solid #d9d9d9;padding-left:6px;margin-top:4px">回复: ${(s.data?.msg_preview || '').replace(/</g,'&lt;')}</div>`;
+        } else if (s.type !== 'text' && s.summary) {
+            mediaHtml += `<span class="msg-media-tag">${s.summary}</span>`;
+        }
+    });
+
     const category = categoryLabel(a.category, a.category_label);
     const secondary = a.secondary_status_label || '未二次复核';
     const reportBasis = a.report_basis_label || '按当前结果上报';
     const notifyText = a.should_notify === false ? '不通知' : (a.notified ? '已通知' : '未通知');
-    return `<div class="alert-item ${sevClass}">
+
+    // 反馈状态
+    const feedback = a.user_feedback || '';
+    const feedbackLabel = feedback === 'confirmed' ? '已确认违规' : (feedback === 'false_positive' ? '已标记误报' : '');
+
+    // 告警ID用于反馈
+    const alertId = a.alert_id || a.id || '';
+    const safeAlertId = String(alertId).replace(/'/g, "\\'");
+
+    return `<div class="alert-item ${sevClass}" id="alert-${safeAlertId}">
         <div style="display:flex;justify-content:space-between;align-items:center">
             <strong><span class="badge badge-${sevClass}">${sevClass.toUpperCase()}</span> ${category} · ${a.violation_type || a.type || '未知'}</strong>
             <small style="color:#999">${time}</small>
@@ -555,6 +589,7 @@ function renderAlertItem(a) {
             <span>二次复核：${String(secondary).replace(/</g,'&lt;')}</span> ·
             <span>上报依据：${String(reportBasis).replace(/</g,'&lt;')}</span> ·
             <span>通知状态：${notifyText}</span>
+            ${feedbackLabel ? ` · <span style="color:${feedback === 'confirmed' ? '#cf1322' : '#52c41a'};font-weight:bold">${feedbackLabel}</span>` : ''}
         </div>
         <div style="margin-top:8px">
             <span>群${groupId}</span> ·
@@ -562,11 +597,30 @@ function renderAlertItem(a) {
             <span>${msgTime}</span>
         </div>
         <div style="margin-top:6px;padding:8px;background:rgba(255,255,255,.6);border-radius:4px">
-            ${String(content).replace(/</g,'&lt;')}
+            <div class="msg-text">${String(content).replace(/</g,'&lt;')}</div>
+            ${mediaHtml}
         </div>
+        ${showOriginal && aiPreview ? `<div style="margin-top:4px;font-size:11px;color:#999;padding:4px 8px;background:rgba(0,0,0,.03);border-radius:4px">AI摘要：${String(aiPreview).replace(/</g,'&lt;')}</div>` : ''}
         ${a.reason ? '<div style="margin-top:4px;font-size:12px;color:#666">判定: ' + a.reason.replace(/</g,'&lt;') + '</div>' : ''}
         ${a.secondary_reason ? '<div style="margin-top:4px;font-size:12px;color:#3b5bdb">二次复核: ' + a.secondary_reason.replace(/</g,'&lt;') + '</div>' : ''}
+        ${safeAlertId ? `<div style="margin-top:8px;display:flex;gap:8px">
+            <button class="btn-secondary" style="font-size:12px;padding:4px 12px" onclick="feedbackAlert('${safeAlertId}','confirmed')">确认违规</button>
+            <button class="btn-secondary" style="font-size:12px;padding:4px 12px" onclick="feedbackAlert('${safeAlertId}','false_positive')">标记误报</button>
+        </div>` : ''}
     </div>`;
+}
+
+async function feedbackAlert(alertId, feedback) {
+    const result = await api('/api/alerts/' + alertId + '/feedback', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({feedback: feedback})
+    });
+    if (result.success) {
+        loadAlerts();
+    } else {
+        alert('反馈失败: ' + (result.error || '未知错误'));
+    }
 }
 
 async function loadGroups() {
@@ -1057,6 +1111,14 @@ class WebPanel:
                 user_id=user_id
             )
             return jsonify(alerts)
+
+        @self._app.route('/api/alerts/<alert_id>/feedback', methods=['POST'])
+        def api_alert_feedback(alert_id):
+            """人工反馈告警：确认违规或标记误报"""
+            data = request.get_json(force=True)
+            feedback = data.get('feedback', '')
+            result = self.store.feedback_alert(alert_id, feedback)
+            return jsonify(result)
 
         @self._app.route('/api/alerts/users')
         def api_alert_users():

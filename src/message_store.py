@@ -155,6 +155,8 @@ class MessageStore:
                             continue
                         try:
                             alert = json.loads(line)
+                            if not alert.get("alert_id"):
+                                alert["alert_id"] = uuid.uuid4().hex[:12]
                             self._alerts.append(alert)
                             loaded_alerts += 1
                         except json.JSONDecodeError:
@@ -215,6 +217,9 @@ class MessageStore:
 
     def save_alert(self, alert: Dict[str, Any]) -> None:
         """保存一条告警记录"""
+        # 确保每条告警有唯一ID
+        if not alert.get("alert_id"):
+            alert["alert_id"] = uuid.uuid4().hex[:12]
         with self._alerts_lock:
             self._alerts.append(alert)
             # 内存中最多保留指定数量告警
@@ -228,6 +233,41 @@ class MessageStore:
                 f.write(json.dumps(alert, ensure_ascii=False) + "\n")
         except Exception as e:
             logger.error(f"写入告警文件失败: {e}")
+
+    def feedback_alert(self, alert_id: str, feedback: str) -> Dict[str, Any]:
+        """对告警进行人工反馈：confirmed 或 false_positive"""
+        result = {"success": False, "error": ""}
+        if feedback not in ("confirmed", "false_positive"):
+            result["error"] = "反馈类型无效，只能是 confirmed 或 false_positive"
+            return result
+
+        with self._alerts_lock:
+            for alert in self._alerts:
+                if alert.get("alert_id") == alert_id:
+                    alert["user_feedback"] = feedback
+                    alert["user_feedback_time"] = datetime.now().isoformat()
+                    result["success"] = True
+                    break
+
+        if not result["success"]:
+            result["error"] = f"未找到告警 ID: {alert_id}"
+            return result
+
+        # 重写告警文件
+        self._rewrite_alerts_file()
+        return result
+
+    def _rewrite_alerts_file(self) -> None:
+        """重写告警文件（用于更新反馈等字段）"""
+        alert_file = os.path.join(self.data_dir, "alerts.jsonl")
+        try:
+            with self._alerts_lock:
+                alerts = self._alerts.copy()
+            with open(alert_file, 'w', encoding='utf-8') as f:
+                for alert in alerts:
+                    f.write(json.dumps(alert, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error(f"重写告警文件失败: {e}")
 
     def on_large_file_pending(self, callback) -> None:
         """注册大文件待确认回调"""
