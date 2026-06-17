@@ -193,6 +193,9 @@ table tr:hover { background: #f8f9ff; }
                     <option value="secondary_unavailable">二次复核不可用</option>
                     <option value="not_reviewed">未二次复核</option>
                 </select>
+                <select id="alertUser">
+                    <option value="">全部用户</option>
+                </select>
                 <button class="btn-primary" onclick="loadAlerts()">刷新</button>
             </div>
             <div id="alertsList"></div>
@@ -290,6 +293,12 @@ table tr:hover { background: #f8f9ff; }
                     <td style="padding:10px"><input type="text" id="aiModel" style="width:100%;padding:8px;border:1px solid #d9d9d9;border-radius:6px" placeholder="qwen2.5"></td></tr>
                 <tr><td style="padding:10px;font-weight:bold">审查间隔(分钟)</td>
                     <td style="padding:10px"><input type="number" id="aiInterval" style="width:100px;padding:8px;border:1px solid #d9d9d9;border-radius:6px" min="1" max="60" value="5"></td></tr>
+                <tr><td style="padding:10px;font-weight:bold">上下文消息</td>
+                    <td style="padding:10px">
+                        上文 <input type="number" id="aiContextBefore" style="width:80px;padding:8px;border:1px solid #d9d9d9;border-radius:6px" min="0" max="50" value="3">
+                        条，下文 <input type="number" id="aiContextAfter" style="width:80px;padding:8px;border:1px solid #d9d9d9;border-radius:6px" min="0" max="50" value="2"> 条
+                        <div class="help-text">AI审查每条目标消息时，会结合指定数量的上下消息，识别拆分广告、前后文攻击、上下文隐私泄露等多条消息关联风险。</div>
+                    </td></tr>
                 <tr><td style="padding:10px;font-weight:bold">系统提示词</td>
                     <td style="padding:10px"><textarea id="aiPrompt" rows="4" style="width:100%;padding:8px;border:1px solid #d9d9d9;border-radius:6px;font-size:13px"></textarea></td></tr>
             </table>
@@ -350,7 +359,7 @@ function switchTab(name) {
     document.getElementById('panel-' + name).classList.add('active');
     if (name === 'dashboard') loadDashboard();
     if (name === 'messages') { loadGroupFilters(); searchMessages(1); }
-    if (name === 'alerts') loadAlerts();
+    if (name === 'alerts') { loadAlertUsers(); loadAlerts(); }
     if (name === 'groups') loadGroups();
     if (name === 'settings') loadSystemConfig();
     if (name === 'aisettings') loadAISettings();
@@ -497,10 +506,12 @@ async function loadAlerts() {
     const severity = document.getElementById('alertSeverity').value;
     const category = document.getElementById('alertCategory').value;
     const secondary = document.getElementById('alertSecondary').value;
+    const user = document.getElementById('alertUser').value;
     const params = new URLSearchParams({ limit: 100 });
     if (severity) params.set('severity', severity);
     if (category) params.set('category', category);
     if (secondary) params.set('secondary_status', secondary);
+    if (user) params.set('user_id', user);
     const alerts = await api('/api/alerts?' + params.toString());
     const container = document.getElementById('alertsList');
 
@@ -509,6 +520,17 @@ async function loadAlerts() {
         return;
     }
     container.innerHTML = alerts.map(a => renderAlertItem(a)).join('');
+}
+
+async function loadAlertUsers() {
+    const users = await api('/api/alerts/users');
+    const sel = document.getElementById('alertUser');
+    const current = sel.value;
+    sel.innerHTML = '<option value="">全部用户</option>' + (users || []).map(u => {
+        const name = String(u.nickname || '未知').replace(/</g,'&lt;');
+        return `<option value="${u.user_id}">${name} (QQ:${u.user_id}) · ${u.count}条</option>`;
+    }).join('');
+    sel.value = current;
 }
 
 function renderAlertItem(a) {
@@ -601,6 +623,8 @@ function loadAISettings() {
         document.getElementById('aiApiKey').value = data.api_key || '';
         document.getElementById('aiModel').value = data.model || '';
         document.getElementById('aiInterval').value = data.review_interval_minutes || 5;
+        document.getElementById('aiContextBefore').value = data.context_before_messages ?? 3;
+        document.getElementById('aiContextAfter').value = data.context_after_messages ?? 2;
         document.getElementById('aiPrompt').value = data.system_prompt || '';
         // 检测预设
         const presetSel = document.getElementById('aiPreset');
@@ -859,6 +883,8 @@ async function saveAIConfig() {
         api_key: document.getElementById('aiApiKey').value.trim(),
         model: document.getElementById('aiModel').value.trim(),
         review_interval: parseInt(document.getElementById('aiInterval').value) || 5,
+        context_before_messages: parseInt(document.getElementById('aiContextBefore').value) || 0,
+        context_after_messages: parseInt(document.getElementById('aiContextAfter').value) || 0,
         system_prompt: document.getElementById('aiPrompt').value.trim()
     };
     const result = await api('/api/ai/config', {
@@ -1020,15 +1046,21 @@ class WebPanel:
             severity = request.args.get('severity', '')
             category = request.args.get('category', '')
             secondary_status = request.args.get('secondary_status', '')
+            user_id = request.args.get('user_id', type=int)
 
             alerts = self.store.get_alerts(
                 limit=limit,
                 group_id=group_id,
                 severity=severity,
                 category=category,
-                secondary_status=secondary_status
+                secondary_status=secondary_status,
+                user_id=user_id
             )
             return jsonify(alerts)
+
+        @self._app.route('/api/alerts/users')
+        def api_alert_users():
+            return jsonify(self.store.get_alert_users())
 
         @self._app.route('/api/groups')
         def api_groups():
@@ -1245,7 +1277,9 @@ class WebPanel:
                 model=data.get('model'),
                 system_prompt=data.get('system_prompt'),
                 enabled=data.get('enabled'),
-                review_interval=data.get('review_interval')
+                review_interval=data.get('review_interval'),
+                context_before_messages=data.get('context_before_messages'),
+                context_after_messages=data.get('context_after_messages')
             )
             return jsonify(result)
 

@@ -857,7 +857,8 @@ class MessageStore:
                    group_id: int = None,
                    severity: str = None,
                    category: str = None,
-                   secondary_status: str = None) -> List[Dict]:
+                   secondary_status: str = None,
+                   user_id: int = None) -> List[Dict]:
         """查询告警记录"""
         with self._alerts_lock:
             alerts = self._alerts.copy()
@@ -870,8 +871,36 @@ class MessageStore:
             alerts = [a for a in alerts if a.get("category") == category]
         if secondary_status:
             alerts = [a for a in alerts if a.get("secondary_status") == secondary_status]
+        if user_id:
+            alerts = [
+                a for a in alerts
+                if (a.get("user_id") or a.get("message", {}).get("user_id")) == user_id
+            ]
 
         return self._sort_alerts_desc(alerts)[:limit]
+
+    def get_alert_users(self) -> List[Dict[str, Any]]:
+        """按用户汇总告警记录"""
+        users: Dict[int, Dict[str, Any]] = {}
+        with self._alerts_lock:
+            alerts = self._alerts.copy()
+        for alert in alerts:
+            msg = alert.get("message", {})
+            uid = alert.get("user_id") or msg.get("user_id")
+            if not uid:
+                continue
+            item = users.setdefault(uid, {
+                "user_id": uid,
+                "nickname": msg.get("card") or msg.get("nickname") or alert.get("nickname", "未知"),
+                "count": 0,
+                "latest_time": ""
+            })
+            item["count"] += 1
+            latest = alert.get("review_time") or alert.get("datetime") or msg.get("datetime", "")
+            if latest > item["latest_time"]:
+                item["latest_time"] = latest
+                item["nickname"] = msg.get("card") or msg.get("nickname") or item["nickname"]
+        return sorted(users.values(), key=lambda x: (-x["count"], x["nickname"]))
 
     def _sort_alerts_desc(self, alerts: List[Dict]) -> List[Dict]:
         """按告警时间从新到旧排序"""
