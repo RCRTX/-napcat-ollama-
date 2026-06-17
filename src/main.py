@@ -157,13 +157,18 @@ class QQMonitor:
         if self.companion:
             try:
                 bot_qq = self.napcat.bot_qq
-                if bot_qq and self.companion.is_mentioned(message, bot_qq):
+                if not bot_qq:
+                    logger.debug(f"陪聊跳过：机器人QQ号尚未获取到")
+                elif self.companion.is_mentioned(message, bot_qq):
                     group_id = message.get("group_id", 0)
+                    logger.info(f"陪聊触发：群{group_id}，用户{message.get('nickname')}@了机器人")
                     # 获取最近上下文
                     recent = self.store._index.get(group_id, [])[-6:]
                     reply = self.companion.generate_reply(message, recent)
                     if reply:
                         self.napcat.send_group_message(group_id, reply)
+                    else:
+                        logger.debug(f"陪聊：AI未生成回复")
             except Exception as e:
                 logger.error(f"陪聊处理失败: {e}")
 

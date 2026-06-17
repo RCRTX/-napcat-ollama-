@@ -569,8 +569,12 @@ class NapCatClient:
         if not hasattr(self, '_bot_qq'):
             self._bot_qq = ""
         if not self._bot_qq:
+            # 先尝试从WebSocket消息中获取（已由_on_ws_message设置）
+            # 再尝试HTTP API
             info = self.get_login_info()
-            self._bot_qq = str(info.get("user_id", ""))
-            if self._bot_qq:
-                logger.info(f"机器人QQ号: {self._bot_qq}")
+            qq = str(info.get("user_id", ""))
+            if qq:
+                self._bot_qq = qq
+                logger.info(f"通过HTTP API获取到机器人QQ号: {self._bot_qq}")
+            # 如果HTTP也失败，_bot_qq保持空，等待WebSocket消息设置
         return self._bot_qq
