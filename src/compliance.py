@@ -176,7 +176,8 @@ class AIReviewer:
                  secondary_api_key: str = None,
                  secondary_model: str = None,
                  secondary_system_prompt: str = None):
-        self.api_base = api_base
+        self.api_base = self._fix_localhost(api_base)
+        self.secondary_api_base = self._fix_localhost(secondary_api_base) if secondary_api_base else None
         self.api_key = api_key
         self.model = model
         self.system_prompt = system_prompt
@@ -184,10 +185,11 @@ class AIReviewer:
         self.context_before_messages = max(0, int(context_before_messages or 0))
         self.context_after_messages = max(0, int(context_after_messages or 0))
         self.secondary_review_enabled = secondary_review_enabled
-        self.secondary_api_base = secondary_api_base or api_base
         self.secondary_api_key = secondary_api_key or api_key
         self.secondary_model = secondary_model or model
         self.secondary_system_prompt = secondary_system_prompt or "你是严格、谨慎、低误报的QQ群聊合规二次复核员。必须只输出JSON。"
+        if not self.secondary_api_base:
+            self.secondary_api_base = self.api_base
         self._last_review_time = 0
         self._is_reviewing = False
         self._last_error = ""
@@ -202,6 +204,13 @@ class AIReviewer:
         self._secondary_client = None
         self._init_client()
         self._init_secondary_client()
+
+    @staticmethod
+    def _fix_localhost(url: str) -> str:
+        """把 localhost 替换为 127.0.0.1，避免 IPv6 解析问题"""
+        if url and isinstance(url, str):
+            return url.replace("//localhost:", "//127.0.0.1:")
+        return url
 
     def _init_client(self) -> None:
         """初始化OpenAI客户端"""
@@ -1082,7 +1091,7 @@ class ChatCompanion:
                  system_prompt: str = "",
                  bot_name: str = "小助手",
                  cooldown_seconds: int = 10):
-        self.api_base = api_base
+        self.api_base = api_base.replace("//localhost:", "//127.0.0.1:") if api_base else api_base
         self.api_key = api_key
         self.model = model
         self.bot_name = bot_name
@@ -1244,9 +1253,9 @@ class ChatCompanion:
 
 
 class Repeater:
-    """复读功能：当同一群内2人以上发送相同消息时，机器人跟发一次"""
+    """复读功能：当同一群内2人以上发送相同消息时，机器人跟发一次（每条消息只复读一次）"""
 
-    def __init__(self, cooldown_seconds: int = 30):
+    def __init__(self, cooldown_seconds: int = 1800):
         self.cooldown_seconds = cooldown_seconds
         # {group_id: {text: {"users": set(), "sent": bool, "last_time": float}}}
         self._groups: Dict[int, Dict[str, Dict]] = {}
